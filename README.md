@@ -1,7 +1,9 @@
 # Sesame
 Clean, secure Go authentication you can own.
 
-Sesame is an open-source collection of **guides, best practices, and reference code** for implementing authentication with **Go + SQL**. It’s heavily inspired by [Lucia Auth](https://lucia-auth.com), a fantastic resource for implementing auth in JavaScript.
+Sesame is an open-source **guide** for implementing authentication with **Go + SQL**. It’s heavily inspired by [Lucia Auth](https://lucia-auth.com), a fantastic resource for implementing auth in JavaScript.
+
+This project is meant to be slightly more structured, starting with a basic sessions implementation and building on top of it with every tutorial. As well as a reference project with everything implemented and a full guide all in one page.
 
 ## What you get
 - ✅ A clear, opinionated approach to auth (sessions, cookies, CSRF, passwords)
@@ -53,3 +55,6 @@ Server-side sessions are straightforward to secure and operationalize:
 - easy auditing and device/session lists
 
 And the performance cost is usually small in practice. Especially if you’re already querying the database for user/org/roles, or if you add caching when needed.
+
+## External dependencies
+Sesame makes use of the standard library where it can, but also includes some amazing libraries like [Goth](https://github.com/markbates/goth), [Webauthn](https://github.com/go-webauthn/webauthn), 
