@@ -1,19 +1,31 @@
-/* Disable sidebar group collapsing */
-.sidebar-content details > summary {
-  pointer-events: none;
-  list-style: none;
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+	--sl-font: 'IBM Plex Sans', sans-serif;
+	--sl-font-mono: 'IBM Plex Mono', monospace;
+	--sl-color-accent-low: #451a03;
+	--sl-color-accent: #d97706;
+	--sl-color-accent-high: #fbbf24;
+	--sl-color-white: #fff;
+	--sl-color-gray-1: #fef3c7;
+	--sl-color-gray-2: #fde68a;
+	--sl-color-gray-3: #92400e;
+	--sl-color-gray-4: #78350f;
+	--sl-color-gray-5: #451a03;
+	--sl-color-gray-6: #291501;
+	--sl-color-black: #1c0a00;
 }
 
-.sidebar-content details > summary::-webkit-details-marker {
-  display: none;
-}
-
-/* Hide the caret icon */
-.sidebar-content details > summary > svg.caret {
-  display: none;
-}
-
-/* Re-enable pointer events for links */
-.sidebar-content details ul a {
-  pointer-events: auto;
+:root[data-theme='light'] {
+	--sl-color-accent-low: #fef3c7;
+	--sl-color-accent: #b45309;
+	--sl-color-accent-high: #78350f;
+	--sl-color-white: #1c0a00;
+	--sl-color-gray-1: #291501;
+	--sl-color-gray-2: #451a03;
+	--sl-color-gray-3: #78350f;
+	--sl-color-gray-4: #92400e;
+	--sl-color-gray-5: #fde68a;
+	--sl-color-gray-6: #fef3c7;
+	--sl-color-black: #fff;
 }
