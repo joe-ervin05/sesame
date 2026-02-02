@@ -1,4 +1,55 @@
 ---
-title: Sesame Overview
-description: Open-source clean, secure Go authentication you can own.
+title: Overview
+description: Open-source guide for implementing authentication with Go and SQL.
 ---
+
+Sesame is a guide for implementing authentication with Go and SQL. It's inspired by [Lucia Auth](https://lucia-auth.com), which does the same thing for JavaScript.
+
+You start with basic sessions and build up from there. Each section adds one piece: rate limiting, inactivity timeouts, OAuth, 2FA, and passkeys. By the end, you have a complete auth system you understand and control.
+
+## What you get
+
+- SQL schemas you can copy and modify
+- Working code for each auth feature
+- A reference server using net/http
+- Patterns for email/password, OAuth, TOTP, and WebAuthn
+
+## What this isn't
+
+- A framework or library you install
+- Middleware that hides how things work
+- JWT-based auth for browsers
+
+## Why sessions over JWTs?
+
+JWTs are self-contained. You validate them with a signature check, no database call needed. That sounds good until you need to:
+
+**Revoke a token.** A JWT is valid until it expires. Want to log out a user everywhere? Kill a stolen token? You need server-side state anyway. A denylist, token versioning, or introspection endpoint. Once you add those, the "no database" benefit disappears.
+
+**Rotate tokens safely.** JWT setups grow into short-lived access tokens plus long-lived refresh tokens, with storage rules, replay detection, and multi-device tracking. More moving parts means more ways to mess up.
+
+**Track sessions.** Many JWT systems eventually add refresh token tables, blacklists, and device lists. At that point you've built sessions, but now your policy is split between what the token says and what the server knows.
+
+## Sessions are simpler
+
+Server-side sessions give you:
+
+- Instant revocation
+- Clean token rotation
+- Easy session lists and auditing
+- One source of truth
+
+The database lookup on each request is usually not a problem. You're probably already querying for user data anyway. Add caching if you need it.
+
+## How to use this guide
+
+Work through the sections in order. Each one builds on the previous:
+
+1. **Sessions** - The foundation. Token generation, storage, and validation.
+2. **Rate Limiting** - Protect your login endpoint from brute force.
+3. **Inactivity Timeouts** - Expire sessions after periods of no activity.
+4. **OAuth** - Let users sign in with GitHub, Google, etc.
+5. **2FA** - Add TOTP-based second factor.
+6. **Passkeys** - WebAuthn for passwordless login.
+
+The code uses Go's standard library where possible. For OAuth and WebAuthn, we use [Goth](https://github.com/markbates/goth) and [go-webauthn](https://github.com/go-webauthn/webauthn).
