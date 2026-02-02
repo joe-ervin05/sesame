@@ -1,0 +1,19 @@
+/* Disable sidebar group collapsing */
+.sidebar-content details > summary {
+  pointer-events: none;
+  list-style: none;
+}
+
+.sidebar-content details > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Hide the caret icon */
+.sidebar-content details > summary > svg.caret {
+  display: none;
+}
+
+/* Re-enable pointer events for links */
+.sidebar-content details ul a {
+  pointer-events: auto;
+}

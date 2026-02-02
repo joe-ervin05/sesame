@@ -9,35 +9,51 @@ export default defineConfig({
 		starlight({
 			title: 'Sesame',
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/joe-ervin05/sesame' }],
+			customCss: ['./src/styles/custom.css'],
 			sidebar: [
-				{
-					label: "Overview",
-					link: "/"
-				},
+				{ label: "Overview", link: "/" },
 				{
 					label: "1. Sessions",
-					autogenerate: { directory: 'sessions' }
+					items: [
+						{ label: "Overview", slug: "sessions/overview" },
+						{ label: "Guide", slug: "sessions/guide" },
+					],
 				},
 				{
 					label: "2. Rate Limiting",
-					autogenerate: { directory: "rate-limiting" }
+					items: [
+						{ label: "Overview", slug: "rate-limiting/overview" },
+						{ label: "Guide", slug: "rate-limiting/guide" },
+					],
 				},
 				{
 					label: "3. Inactivity Timeouts",
-					autogenerate: { directory: "inactivity-timeouts" }
+					items: [
+						{ label: "Overview", slug: "inactivity-timeouts/overview" },
+						{ label: "Guide", slug: "inactivity-timeouts/guide" },
+					],
 				},
 				{
 					label: "4. OAuth",
-					autogenerate: { directory: "oauth" }
+					items: [
+						{ label: "Overview", slug: "oauth/overview" },
+						{ label: "Guide", slug: "oauth/guide" },
+					],
 				},
 				{
 					label: "5. 2FA",
-					autogenerate: { directory: "mfa" }
+					items: [
+						{ label: "Overview", slug: "2fa/overview" },
+						{ label: "Guide", slug: "2fa/guide" },
+					],
 				},
 				{
 					label: "6. Passkeys",
-					autogenerate: { directory: "passkeys" }
-				}
+					items: [
+						{ label: "Overview", slug: "passkeys/overview" },
+						{ label: "Guide", slug: "passkeys/guide" },
+					],
+				},
 			],
 		}),
 	],
