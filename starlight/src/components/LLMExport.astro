@@ -1,0 +1,89 @@
+---
+interface Props {
+  title: string;
+  slug: string;
+}
+
+const { title, slug } = Astro.props;
+const markdownUrl = `https://raw.githubusercontent.com/joe-ervin05/sesame/main/starlight/src/content/docs/${slug === 'index' ? 'index' : slug}.mdx`;
+---
+
+<div class="llm-export">
+  <button class="copy-llm" data-url={markdownUrl} data-title={title}>
+    Copy for LLM
+  </button>
+  <a href={markdownUrl} target="_blank" rel="noopener" class="view-markdown">
+    View as Markdown
+  </a>
+</div>
+
+<script>
+  document.querySelectorAll('.copy-llm').forEach(button => {
+    button.addEventListener('click', async (e) => {
+      const btn = e.target as HTMLButtonElement;
+      const url = btn.dataset.url;
+      const title = btn.dataset.title;
+
+      try {
+        const response = await fetch(url!);
+        if (!response.ok) {
+          // Fallback: copy page text content
+          const content = document.querySelector('.sl-markdown-content');
+          if (content) {
+            const text = `# ${title}\n\n${content.textContent}`;
+            await navigator.clipboard.writeText(text);
+            btn.textContent = 'Copied!';
+            setTimeout(() => btn.textContent = 'Copy for LLM', 2000);
+          }
+          return;
+        }
+
+        const markdown = await response.text();
+        // Remove frontmatter
+        const cleaned = markdown.replace(/^---[\s\S]*?---\n*/, '');
+        const text = `# ${title}\n\n${cleaned}`;
+
+        await navigator.clipboard.writeText(text);
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = 'Copy for LLM', 2000);
+      } catch (err) {
+        // Fallback: copy page text content
+        const content = document.querySelector('.sl-markdown-content');
+        if (content) {
+          const text = `# ${title}\n\n${content.textContent}`;
+          await navigator.clipboard.writeText(text);
+          btn.textContent = 'Copied!';
+          setTimeout(() => btn.textContent = 'Copy for LLM', 2000);
+        }
+      }
+    });
+  });
+</script>
+
+<style>
+  .llm-export {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--sl-color-gray-5);
+  }
+
+  .copy-llm,
+  .view-markdown {
+    font-size: 0.8rem;
+    padding: 0.4rem 0.75rem;
+    border-radius: 4px;
+    background: var(--sl-color-gray-6);
+    color: var(--sl-color-white);
+    border: 1px solid var(--sl-color-gray-5);
+    cursor: pointer;
+    text-decoration: none;
+    transition: background 0.15s;
+  }
+
+  .copy-llm:hover,
+  .view-markdown:hover {
+    background: var(--sl-color-gray-5);
+  }
+</style>
