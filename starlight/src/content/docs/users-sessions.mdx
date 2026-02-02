@@ -7,4 +7,399 @@ import LLMExport from '../../components/LLMExport.astro';
 
 <LLMExport title="Users & Sessions" slug="users-sessions" />
 
-Coming soon...
+HTTP doesn't remember anything between requests. Your server can't tell if two requests came from the same person. Cookies exist, but anyone could edit a "user_id" cookie to pretend they're someone else.
+
+Sessions fix this. When someone signs in, you create a session on the server and hand them an unguessable token. They send that token back with each request. If it matches, you know who they are.
+
+We use `TEXT` for IDs and recommend [nanoids](https://github.com/matoous/go-nanoid). They're shorter than UUIDs, URL-safe, and you can double-click to select them (UUIDs with hyphens break on word boundaries). Avoid auto-incrementing integers. They let attackers enumerate your users and reveal how many records you have.
+
+## Session table
+
+Sessions have an ID, a hashed secret, and a user reference. The ID and secret are separate to prevent timing attacks during lookup and avoid hashing client input before knowing the session exists. The secret gets hashed before storage so a database leak won't compromise every session at once.
+
+```sql
+CREATE TABLE session (
+    id TEXT NOT NULL PRIMARY KEY,
+    secret_hash BLOB NOT NULL,
+    user_id TEXT NOT NULL REFERENCES user(id),
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX session_user_id_idx ON session(user_id);
+```
+
+The `secret_hash` stores as raw bytes. You could hex or base64 encode it if you prefer text, but binary takes less space.
+
+
+## User table
+
+You define what goes in the user table. You need an ID at minimum. Add whatever else your app needs. Email, username, timestamps, etc.
+
+```sql
+CREATE TABLE user (
+    id TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+```
+
+## Token format
+
+The token you send to clients looks like this:
+
+```
+<session_id>.<session_secret>
+```
+
+Both parts are random strings with at least 120 bits of entropy. The ID finds the session. The secret proves the client owns it.
+
+## Generating IDs
+
+Use [go-nanoid](https://github.com/matoous/go-nanoid) to generate IDs:
+
+```go
+import gonanoid "github.com/matoous/go-nanoid/v2"
+
+// For user IDs, 12 characters is plenty
+userID, err := gonanoid.New(12)
+
+// For session IDs and secrets, use 21 characters (the default)
+sessionID, err := gonanoid.New()
+```
+
+Nanoid uses `crypto/rand` under the hood, so the IDs are cryptographically secure. A 21-character nanoid has about 126 bits of entropy. More than enough to prevent brute-force guessing.
+
+## Creating a session
+
+When someone signs in, create a session and return the token:
+
+```go
+package auth
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"time"
+
+	gonanoid "github.com/matoous/go-nanoid/v2"
+)
+
+type Session struct {
+	ID         string
+	SecretHash []byte
+	UserID     string
+	CreatedAt  time.Time
+}
+
+func CreateSession(ctx context.Context, db *sql.DB, userID string) (token string, err error) {
+	id, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	secret, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	secretHash := hashSecret(secret)
+	now := time.Now().UTC()
+
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO session (id, secret_hash, user_id, created_at) VALUES (?, ?, ?, ?)",
+		id, secretHash, userID, now.Unix(),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return id + "." + secret, nil
+}
+
+func hashSecret(secret string) []byte {
+	hash := sha256.Sum256([]byte(secret))
+	return hash[:]
+}
+```
+
+SHA-256 works fine here. Unlike passwords, the secret already has 120 bits of entropy. You can't brute-force it. A fast hash is fine.
+
+## Validating a session
+
+On each request, grab the token from the cookie, validate its format, look up the session, check expiration, and verify the secret.
+
+Validate the token format before doing anything else. Reject tokens that don't match the expected length. This prevents garbage input from hitting your database and keeps your logs clean.
+
+```go
+package auth
+
+import (
+	"context"
+	"crypto/subtle"
+	"database/sql"
+	"errors"
+	"strings"
+	"time"
+)
+
+const SessionExpiresIn = 24 * time.Hour
+const sessionTokenPartLength = 21
+
+var ErrInvalidSession = errors.New("invalid session")
+
+func ValidateSession(ctx context.Context, db *sql.DB, token string) (*Session, error) {
+	parts := strings.SplitN(token, ".", 2)
+	if len(parts) != 2 {
+		return nil, ErrInvalidSession
+	}
+
+	sessionID, secret := parts[0], parts[1]
+
+	// Reject malformed tokens before touching the database
+	if len(sessionID) != sessionTokenPartLength || len(secret) != sessionTokenPartLength {
+		return nil, ErrInvalidSession
+	}
+
+	session, err := getSession(ctx, db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil {
+		return nil, ErrInvalidSession
+	}
+
+	// Check expiration
+	if time.Since(session.CreatedAt) > SessionExpiresIn {
+		_ = DeleteSession(ctx, db, sessionID)
+		return nil, ErrInvalidSession
+	}
+
+	// Constant-time comparison
+	secretHash := hashSecret(secret)
+	if subtle.ConstantTimeCompare(secretHash, session.SecretHash) != 1 {
+		return nil, ErrInvalidSession
+	}
+
+	return session, nil
+}
+
+func getSession(ctx context.Context, db *sql.DB, sessionID string) (*Session, error) {
+	row := db.QueryRowContext(ctx,
+		"SELECT id, secret_hash, user_id, created_at FROM session WHERE id = ?",
+		sessionID,
+	)
+
+	var session Session
+	var createdAt int64
+	err := row.Scan(&session.ID, &session.SecretHash, &session.UserID, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	session.CreatedAt = time.Unix(createdAt, 0)
+	return &session, nil
+}
+
+func DeleteSession(ctx context.Context, db *sql.DB, sessionID string) error {
+	_, err := db.ExecContext(ctx, "DELETE FROM session WHERE id = ?", sessionID)
+	return err
+}
+```
+
+`subtle.ConstantTimeCompare` prevents timing attacks. A regular comparison might return early on the first wrong byte, leaking info about how much was correct. Constant-time comparison takes the same time no matter where the mismatch is.
+
+## Deleting all sessions for a user
+
+When someone changes their password or you spot suspicious activity, kill all their sessions:
+
+```go
+func DeleteUserSessions(ctx context.Context, db *sql.DB, userID string) error {
+	_, err := db.ExecContext(ctx, "DELETE FROM session WHERE user_id = ?", userID)
+	return err
+}
+```
+
+## Storing the token in a cookie
+
+Send the token in an HttpOnly cookie. JavaScript can't read HttpOnly cookies, which protects against XSS.
+
+```go
+package auth
+
+import (
+	"net/http"
+)
+
+const SessionCookieName = "session"
+
+func SetSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(SessionExpiresIn.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func ClearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func GetSessionToken(r *http.Request) string {
+	cookie, err := r.Cookie(SessionCookieName)
+	if err != nil {
+		return ""
+	}
+	return cookie.Value
+}
+```
+
+What each attribute does:
+- **HttpOnly**: JavaScript can't touch it
+- **Secure**: Only sent over HTTPS
+- **SameSite=Lax**: Sent on normal navigation, blocked on cross-site requests
+- **Path=/**: Works on all routes
+- **MaxAge**: Matches your session expiration
+
+## CSRF protection
+
+`SameSite=Lax` helps, but you should still check the Origin header on requests that change data:
+
+```go
+func VerifyRequestOrigin(r *http.Request, allowedOrigin string) bool {
+	if r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" {
+		return true
+	}
+
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		origin = r.Header.Get("Referer")
+	}
+
+	return origin == allowedOrigin
+}
+```
+
+Use this in middleware for any endpoint that modifies state.
+
+Origin checking is a lightweight option when combined with SameSite cookies and same-origin APIs. For higher-risk apps or cross-site POST use cases, use a CSRF token instead (the synchronizer token pattern).
+
+## Middleware
+
+Here's middleware that validates sessions and attaches them to the request context:
+
+```go
+package auth
+
+import (
+	"context"
+	"database/sql"
+	"net/http"
+)
+
+type contextKey string
+
+const sessionContextKey contextKey = "session"
+
+func SessionMiddleware(db *sql.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := GetSessionToken(r)
+			if token == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			session, err := ValidateSession(r.Context(), db, token)
+			if err != nil {
+				ClearSessionCookie(w)
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), sessionContextKey, session)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func GetSession(ctx context.Context) *Session {
+	session, _ := ctx.Value(sessionContextKey).(*Session)
+	return session
+}
+
+func RequireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if GetSession(r.Context()) == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+## Putting it together
+
+```go
+func main() {
+	db, _ := sql.Open("sqlite3", "app.db")
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /", handleHome)
+	mux.HandleFunc("POST /login", handleLogin(db))
+	mux.HandleFunc("POST /logout", handleLogout(db))
+
+	mux.Handle("GET /dashboard", auth.RequireSession(http.HandlerFunc(handleDashboard)))
+
+	handler := auth.SessionMiddleware(db)(mux)
+
+	http.ListenAndServe(":8080", handler)
+}
+
+func handleLogin(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ... validate credentials ...
+
+		token, err := auth.CreateSession(r.Context(), db, user.ID)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		auth.SetSessionCookie(w, token)
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	}
+}
+
+func handleLogout(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session != nil {
+			_ = auth.DeleteSession(r.Context(), db, session.ID)
+		}
+
+		auth.ClearSessionCookie(w)
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
+}
+```
+
+## Next up
+
+You've got the foundation now. Head to [Email & Password](/email-password) to add account creation and login.
