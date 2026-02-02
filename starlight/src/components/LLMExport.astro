@@ -5,7 +5,7 @@ interface Props {
 }
 
 const { title, slug } = Astro.props;
-const markdownUrl = `https://raw.githubusercontent.com/joe-ervin05/sesame/main/starlight/src/content/docs/${slug === 'index' ? 'index' : slug}.mdx`;
+const markdownUrl = `https://raw.githubusercontent.com/joe-ervin05/sesame/main/starlight/src/content/docs/${slug === "index" ? "index" : slug}.mdx`;
 ---
 
 <div class="llm-export">
@@ -18,8 +18,8 @@ const markdownUrl = `https://raw.githubusercontent.com/joe-ervin05/sesame/main/s
 </div>
 
 <script>
-  document.querySelectorAll('.copy-llm').forEach(button => {
-    button.addEventListener('click', async (e) => {
+  document.querySelectorAll(".copy-llm").forEach((button) => {
+    button.addEventListener("click", async (e) => {
       const btn = e.target as HTMLButtonElement;
       const url = btn.dataset.url;
       const title = btn.dataset.title;
@@ -28,32 +28,32 @@ const markdownUrl = `https://raw.githubusercontent.com/joe-ervin05/sesame/main/s
         const response = await fetch(url!);
         if (!response.ok) {
           // Fallback: copy page text content
-          const content = document.querySelector('.sl-markdown-content');
+          const content = document.querySelector(".sl-markdown-content");
           if (content) {
             const text = `# ${title}\n\n${content.textContent}`;
             await navigator.clipboard.writeText(text);
-            btn.textContent = 'Copied!';
-            setTimeout(() => btn.textContent = 'Copy for LLM', 2000);
+            btn.textContent = "Copied!";
+            setTimeout(() => (btn.textContent = "Copy for LLM"), 2000);
           }
           return;
         }
 
         const markdown = await response.text();
         // Remove frontmatter
-        const cleaned = markdown.replace(/^---[\s\S]*?---\n*/, '');
+        const cleaned = markdown.replace(/^---[\s\S]*?---\n*/, "");
         const text = `# ${title}\n\n${cleaned}`;
 
         await navigator.clipboard.writeText(text);
-        btn.textContent = 'Copied!';
-        setTimeout(() => btn.textContent = 'Copy for LLM', 2000);
+        btn.textContent = "Copied!";
+        setTimeout(() => (btn.textContent = "Copy for LLM"), 2000);
       } catch (err) {
         // Fallback: copy page text content
-        const content = document.querySelector('.sl-markdown-content');
+        const content = document.querySelector(".sl-markdown-content");
         if (content) {
           const text = `# ${title}\n\n${content.textContent}`;
           await navigator.clipboard.writeText(text);
-          btn.textContent = 'Copied!';
-          setTimeout(() => btn.textContent = 'Copy for LLM', 2000);
+          btn.textContent = "Copied!";
+          setTimeout(() => (btn.textContent = "Copy for LLM"), 2000);
         }
       }
     });
