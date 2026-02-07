@@ -1,0 +1,690 @@
+---
+title: Verification & Recovery
+description: Email verification codes, password reset tokens, and password changes.
+---
+
+import LLMExport from '../../components/LLMExport.astro';
+
+<LLMExport title="Verification & Recovery" slug="verification-recovery" />
+
+This builds on [Password Signup & Login](/password-signup-login). You'll add email verification, password reset, and password change functionality.
+
+## Before you start
+
+- Go 1.22+
+- Completed code from [Users & Sessions](/users-sessions), [Email & Password](/email-password), and [Password Signup & Login](/password-signup-login)
+- A database connection via `database/sql`
+- A mailer implementation for verification and reset emails
+- HTML pages/templates for verification and password-reset forms
+
+## File layout
+
+Build on the earlier structure by adding verification/recovery files:
+
+```diff
+ /auth
+   /sessions.go
+   /cookies.go
+   /middleware.go
+   /passwords.go
+   /users.go
++  /verification.go      // email verification code generation + verification
++  /recovery.go          // reset tokens + reset + change password
+ /handlers
+   /auth.go
+   /pages.go             // verify/forgot/reset page rendering
++  /verification.go      // send/verify email code handlers
++  /recovery.go          // forgot/reset password handlers
+ /main.go
+```
+
+## Email verification
+
+After signup, verify the user owns the email address they provided. Send them a code and have them enter it back into your app.
+
+Codes work better than clickable links. Users are trained to distrust email links (for good reason). Codes also let users check email on their phone and enter the code on their computer.
+
+### Verification code table
+
+```sql
+CREATE TABLE email_verification_codes (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    email TEXT NOT NULL,
+    code_hash BLOB NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX email_verification_codes_user_id_idx ON email_verification_codes(user_id);
+```
+
+Store the code hashed. If your database leaks, attackers can't use the codes to verify arbitrary emails.
+
+### Generating codes
+
+Use 8 random digits. That's about 26 bits of entropy, which is enough when combined with rate limiting and expiration.
+
+Put this in `auth/verification.go`:
+
+```go
+package auth
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"math/big"
+)
+
+func GenerateVerificationCode() (string, error) {
+	const digits = "0123456789"
+	code := make([]byte, 8)
+
+	for i := range code {
+		num, err := rand.Int(rand.Reader, big.NewInt(10))
+		if err != nil {
+			return "", err
+		}
+		code[i] = digits[num.Int64()]
+	}
+
+	return string(code), nil
+}
+
+func hashCode(code string) []byte {
+	hash := sha256.Sum256([]byte(code))
+	return hash[:]
+}
+```
+
+### Creating a verification code
+
+Put this in `auth/verification.go`:
+
+```go
+const EmailVerificationExpiry = 15 * time.Minute
+
+type EmailVerificationCode struct {
+	ID        string
+	UserID    string
+	Email     string
+	CodeHash  []byte
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+func CreateEmailVerificationCode(ctx context.Context, db *sql.DB, userID, email string) (string, error) {
+	// Delete any existing codes for this user
+	_, err := db.ExecContext(ctx, "DELETE FROM email_verification_codes WHERE user_id = ?", userID)
+	if err != nil {
+		return "", err
+	}
+
+	code, err := GenerateVerificationCode()
+	if err != nil {
+		return "", err
+	}
+
+	id, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(EmailVerificationExpiry)
+
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO email_verification_codes (id, user_id, email, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		id, userID, NormalizeEmail(email), hashCode(code), expiresAt.Unix(), now.Unix(),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return code, nil
+}
+```
+
+Delete existing codes before creating a new one. This prevents users from having multiple valid codes floating around and simplifies the verification logic.
+
+### Verifying the code
+
+Put this in `auth/verification.go`:
+
+```go
+var ErrInvalidCode = errors.New("invalid or expired code")
+
+func VerifyEmailCode(ctx context.Context, db *sql.DB, userID, code string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Atomically consume the code - only one caller can delete it
+	row := tx.QueryRowContext(ctx,
+		`DELETE FROM email_verification_codes
+		WHERE user_id = ?
+		  AND code_hash = ?
+		  AND expires_at > ?
+		RETURNING email`,
+		userID, hashCode(code), time.Now().UTC().Unix(),
+	)
+
+	var codeEmail string
+	err = row.Scan(&codeEmail)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidCode
+	}
+	if err != nil {
+		return err
+	}
+
+	// Mark verified only if user's current email matches the code's email
+	result, err := tx.ExecContext(ctx,
+		"UPDATE users SET email_verified = 1 WHERE id = ? AND email = ?",
+		userID, codeEmail,
+	)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrInvalidCode // email changed since code was issued
+	}
+
+	return tx.Commit()
+}
+```
+
+This uses `DELETE ... RETURNING` to consume the code atomically. If your SQL dialect does not support `RETURNING`, do the lookup and delete in a transaction with row locking.
+
+### Verification handlers
+
+Put this in `handlers/verification.go`:
+
+```go
+package handlers
+
+import (
+	"database/sql"
+	"errors"
+	"html"
+	"net/http"
+
+	auth "github.com/.../auth"
+)
+
+func renderFormError(w http.ResponseWriter, status int, title, message, backPath string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte("<!doctype html><html><body><h1>" + html.EscapeString(title) + "</h1><p>" + html.EscapeString(message) + "</p><p><a href=\"" + html.EscapeString(backPath) + "\">Go back</a></p></body></html>"))
+}
+
+func HandleSendVerificationCode(db *sql.DB, mailer Mailer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+
+		user, err := auth.GetUserByID(r.Context(), db, session.UserID)
+		if err != nil || user == nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		if user.EmailVerified {
+			http.Error(w, "Email already verified", http.StatusBadRequest)
+			return
+		}
+
+		code, err := auth.CreateEmailVerificationCode(r.Context(), db, user.ID, user.Email)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		err = mailer.SendVerificationEmail(user.Email, code)
+		if err != nil {
+			http.Error(w, "Failed to send email", http.StatusInternalServerError)
+			return
+		}
+
+		http.Redirect(w, r, "/verify-email", http.StatusSeeOther)
+	}
+}
+
+func HandleVerifyEmail(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		code := r.FormValue("code")
+		if code == "" {
+			renderFormError(w, http.StatusBadRequest, "Verification failed", "Code required", "/verify-email")
+			return
+		}
+
+		err := auth.VerifyEmailCode(r.Context(), db, session.UserID, code)
+		if errors.Is(err, auth.ErrInvalidCode) {
+			renderFormError(w, http.StatusBadRequest, "Verification failed", "Invalid or expired code", "/verify-email")
+			return
+		}
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	}
+}
+```
+
+### Rate limit verification requests
+
+Don't let users spam the verification endpoint. Limit to about 10 attempts per hour per user. See [Rate Limiting](/rate-limiting) for implementation details.
+
+## Password reset
+
+When users forget their password, send them a reset link with a secure token.
+
+### Reset token table
+
+```sql
+CREATE TABLE password_reset_tokens (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    token_hash BLOB NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX password_reset_tokens_user_id_idx ON password_reset_tokens(user_id);
+```
+
+### Creating a reset token
+
+Put this in `auth/recovery.go`:
+
+```go
+const PasswordResetExpiry = 1 * time.Hour
+
+type PasswordResetToken struct {
+	ID        string
+	UserID    string
+	TokenHash []byte
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+func CreatePasswordResetToken(ctx context.Context, db *sql.DB, userID string) (string, error) {
+	// Delete any existing tokens for this user
+	_, err := db.ExecContext(ctx, "DELETE FROM password_reset_tokens WHERE user_id = ?", userID)
+	if err != nil {
+		return "", err
+	}
+
+	token, err := gonanoid.New(32)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	tokenHash := sha256.Sum256([]byte(token))
+	now := time.Now().UTC()
+	expiresAt := now.Add(PasswordResetExpiry)
+
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+		id, userID, tokenHash[:], expiresAt.Unix(), now.Unix(),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return token, nil
+}
+```
+
+Reset tokens get 32 characters (about 190 bits of entropy). Hash them with SHA-256 before storage. If someone gets your database, they can't use the tokens.
+
+Set expiration to one hour. That's long enough for legitimate users but limits the window for attackers.
+
+### Using the token
+
+Put this in `auth/recovery.go`:
+
+```go
+var ErrInvalidToken = errors.New("invalid or expired token")
+var ErrPasswordsDoNotMatch = errors.New("passwords do not match")
+
+func ResetPassword(ctx context.Context, db *sql.DB, token, newPassword, confirmPassword string) error {
+	if newPassword != confirmPassword {
+		return ErrPasswordsDoNotMatch
+	}
+
+	if err := ValidatePassword(newPassword); err != nil {
+		return err
+	}
+
+	if err := CheckPasswordBreach(newPassword); err != nil {
+		return err
+	}
+
+	newHash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Atomically consume the token - only one caller can delete it
+	tokenHash := sha256.Sum256([]byte(token))
+	row := tx.QueryRowContext(ctx,
+		`DELETE FROM password_reset_tokens
+		WHERE token_hash = ?
+		  AND expires_at > ?
+		RETURNING user_id`,
+		tokenHash[:], time.Now().UTC().Unix(),
+	)
+
+	var userID string
+	err = row.Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidToken
+	}
+	if err != nil {
+		return err
+	}
+
+	// Update password
+	_, err = tx.ExecContext(ctx,
+		"UPDATE users SET password_hash = ? WHERE id = ?",
+		newHash, userID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Invalidate all sessions
+	_, err = tx.ExecContext(ctx, "DELETE FROM sessions WHERE user_id = ?", userID)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+```
+
+This also uses `DELETE ... RETURNING`. If your database does not support it, use a transaction that selects the token row first, checks expiry, then deletes and updates.
+
+After a password reset, invalidate all existing sessions. If someone stole the account and the real owner resets the password, the attacker gets logged out.
+
+### Reset handlers
+
+Put this in `handlers/recovery.go`:
+
+```go
+package handlers
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/http"
+
+	auth "github.com/.../auth"
+)
+
+// Reuse renderFormError from handlers/verification.go.
+
+func HandleForgotPassword(db *sql.DB, mailer Mailer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		email := r.FormValue("email")
+		if email == "" {
+			renderFormError(w, http.StatusBadRequest, "Forgot password", "Email required", "/forgot-password")
+			return
+		}
+
+		// Always return the same response to prevent email enumeration
+		user, err := auth.GetUserByEmail(r.Context(), db, email)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		if user != nil {
+			token, err := auth.CreatePasswordResetToken(r.Context(), db, user.ID)
+			if err == nil {
+				resetURL := fmt.Sprintf("https://example.com/reset-password?token=%s", token)
+				_ = mailer.SendPasswordResetEmail(user.Email, resetURL)
+			}
+		}
+
+		// Same message whether user exists or not
+		http.Redirect(w, r, "/forgot-password?sent=1", http.StatusSeeOther)
+	}
+}
+
+func HandleResetPassword(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.FormValue("token")
+		newPassword := r.FormValue("password")
+		confirmPassword := r.FormValue("password_confirm")
+
+		if token == "" || newPassword == "" {
+			renderFormError(w, http.StatusBadRequest, "Reset password", "Token and password required", "/reset-password?token="+token)
+			return
+		}
+
+		err := auth.ResetPassword(r.Context(), db, token, newPassword, confirmPassword)
+		if errors.Is(err, auth.ErrInvalidToken) {
+			renderFormError(w, http.StatusBadRequest, "Reset password", "Invalid or expired reset link", "/forgot-password")
+			return
+		}
+		if errors.Is(err, auth.ErrPasswordsDoNotMatch) ||
+			errors.Is(err, auth.ErrPasswordTooShort) ||
+			errors.Is(err, auth.ErrPasswordTooLong) ||
+			errors.Is(err, auth.ErrPasswordBreached) {
+			renderFormError(w, http.StatusBadRequest, "Reset password", err.Error(), "/reset-password?token="+token)
+			return
+		}
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		http.Redirect(w, r, "/login?reset=1", http.StatusSeeOther)
+	}
+}
+```
+
+The forgot password handler returns the same response whether the email exists or not. This prevents attackers from using it to discover which emails are registered.
+
+### Referrer policy
+
+Set a strict Referrer-Policy header on your reset password page. Otherwise the token might leak in the Referer header if users click external links.
+
+Set this header in your reset-password page handler (example shown in the rendering section below).
+
+## Route wiring
+
+Put this in `main.go`:
+
+```go
+allowedOrigin := "https://example.com"
+
+requireSameOrigin := func(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !auth.VerifyRequestOrigin(r, allowedOrigin) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+mux.Handle("POST /verify/send", requireSameOrigin(auth.RequireSession(handlers.HandleSendVerificationCode(db, mailer))))
+mux.Handle("POST /verify/confirm", requireSameOrigin(auth.RequireSession(handlers.HandleVerifyEmail(db))))
+
+mux.Handle("POST /password/forgot", requireSameOrigin(handlers.HandleForgotPassword(db, mailer)))
+mux.Handle("POST /password/reset", requireSameOrigin(handlers.HandleResetPassword(db)))
+
+// Optional page rendering routes
+mux.Handle("GET /verify-email", auth.RequireSession(http.HandlerFunc(handlers.HandleVerifyEmailPage)))
+mux.HandleFunc("GET /forgot-password", handlers.HandleForgotPasswordPage)
+mux.HandleFunc("GET /reset-password", handlers.HandleResetPasswordPage)
+```
+
+This applies origin checks to every state-changing verification and recovery route.
+
+## Rendering pages
+
+Put this in `handlers/pages.go`:
+
+```go
+package handlers
+
+import (
+	"html/template"
+	"net/http"
+)
+
+func HandleVerifyEmailPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <body>
+    <h1>Verify your email</h1>
+    <form method="post" action="/verify/confirm">
+      <label>Verification code <input name="code" inputmode="numeric" required /></label><br />
+      <button type="submit">Verify email</button>
+    </form>
+    <form method="post" action="/verify/send">
+      <button type="submit">Send a new code</button>
+    </form>
+  </body>
+</html>`))
+}
+
+func HandleForgotPasswordPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <body>
+    <h1>Forgot password</h1>
+    <form method="post" action="/password/forgot">
+      <label>Email <input name="email" type="email" required /></label><br />
+      <button type="submit">Send reset link</button>
+    </form>
+  </body>
+</html>`))
+}
+
+func HandleResetPasswordPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Referrer-Policy", "strict-origin")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	token := r.URL.Query().Get("token")
+	escapedToken := template.HTMLEscapeString(token)
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <body>
+    <h1>Reset password</h1>
+    <form method="post" action="/password/reset">
+      <input type="hidden" name="token" value="` + escapedToken + `" />
+      <label>New password <input name="password" type="password" required /></label><br />
+      <label>Confirm password <input name="password_confirm" type="password" required /></label><br />
+      <button type="submit">Reset password</button>
+    </form>
+  </body>
+</html>`))
+}
+```
+
+## Changing passwords
+
+When a logged-in user changes their password, require their current password first:
+
+Put this in `auth/recovery.go`:
+
+```go
+var ErrInvalidCurrentPassword = errors.New("current password is incorrect")
+
+func ChangePassword(ctx context.Context, db *sql.DB, userID, currentPassword, newPassword string) error {
+	// Get current user
+	row := db.QueryRowContext(ctx,
+		"SELECT password_hash FROM users WHERE id = ?",
+		userID,
+	)
+
+	var currentHash string
+	if err := row.Scan(&currentHash); err != nil {
+		return err
+	}
+
+	// Verify current password
+	if !VerifyPassword(currentPassword, currentHash) {
+		return ErrInvalidCurrentPassword
+	}
+
+	// Validate and hash new password
+	if err := ValidatePassword(newPassword); err != nil {
+		return err
+	}
+
+	if err := CheckPasswordBreach(newPassword); err != nil {
+		return err
+	}
+
+	newHash, err := HashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+
+	// Update password
+	_, err = db.ExecContext(ctx,
+		"UPDATE users SET password_hash = ? WHERE id = ?",
+		newHash, userID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Invalidate all sessions
+	return DeleteUserSessions(ctx, db, userID)
+}
+```
+
+Requiring the current password protects against session hijacking. If someone steals a session, they can't lock the real user out by changing the password.
+
+Flow checklist:
+1. Send a verification code and mark email verified after successful code confirmation
+2. Accept forgot-password requests with the same response regardless of account existence
+3. Consume reset tokens atomically, then rotate password hash and revoke all sessions
+4. Require current password for authenticated password changes and revoke all sessions after change
+
+## Next up
+
+You have working authentication now. Head to [Rate Limiting](/rate-limiting) to protect your login, verification, and reset endpoints from brute-force attacks.
