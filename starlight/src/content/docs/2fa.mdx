@@ -49,6 +49,17 @@ CREATE TABLE user_recovery_codes (
 );
 
 CREATE INDEX user_recovery_codes_user_id_idx ON user_recovery_codes(user_id);
+
+CREATE TABLE user_totp_pending_setups (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    token_hash BLOB NOT NULL UNIQUE,
+    secret_encrypted TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
+CREATE INDEX user_totp_pending_setups_user_id_idx ON user_totp_pending_setups(user_id);
 ```
 
 ## Session auth levels
@@ -116,8 +127,10 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -129,6 +142,11 @@ import (
 )
 
 var ErrInvalidTwoFactorCode = errors.New("invalid two-factor code")
+
+// EncryptValue/DecryptValue should use authenticated encryption (AES-256-GCM)
+// with a server-side key (KMS or env-injected key material).
+func EncryptValue(plain string) (string, error) { panic("implement me") }
+func DecryptValue(ciphertext string) (string, error) { panic("implement me") }
 
 func HasTwoFactorEnabled(ctx context.Context, db *sql.DB, userID string) (bool, error) {
 	row := db.QueryRowContext(ctx,
@@ -162,6 +180,104 @@ func VerifyTOTPCode(secret, code string, now time.Time) bool {
 	)
 }
 
+func UpsertUserTOTPSecret(ctx context.Context, db *sql.DB, userID, secret string) error {
+	secretEncrypted, err := EncryptValue(secret)
+	if err != nil {
+		return err
+	}
+	credentialID, err := gonanoid.New()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Unix()
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO user_totp_credentials (id, user_id, secret_encrypted, created_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET secret_encrypted = excluded.secret_encrypted
+	`, credentialID, userID, secretEncrypted, now)
+	return err
+}
+
+func LoadUserTOTPSecret(ctx context.Context, db *sql.DB, userID string) (string, error) {
+	row := db.QueryRowContext(ctx,
+		"SELECT secret_encrypted FROM user_totp_credentials WHERE user_id = ?",
+		userID,
+	)
+	var secretEncrypted string
+	if err := row.Scan(&secretEncrypted); err != nil {
+		return "", err
+	}
+	return DecryptValue(secretEncrypted)
+}
+
+func randomToken(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func CreatePendingTwoFactorSetup(ctx context.Context, db *sql.DB, userID, secret string, ttl time.Duration) (string, error) {
+	secretEncrypted, err := EncryptValue(secret)
+	if err != nil {
+		return "", err
+	}
+	token, err := randomToken(32)
+	if err != nil {
+		return "", err
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	setupID, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+
+	_, err = db.ExecContext(ctx,
+		"DELETE FROM user_totp_pending_setups WHERE user_id = ?",
+		userID,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO user_totp_pending_setups (id, user_id, token_hash, secret_encrypted, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, setupID, userID, tokenHash[:], secretEncrypted, now.Unix(), now.Add(ttl).Unix())
+	if err != nil {
+		return "", err
+	}
+
+	return token, nil
+}
+
+func ConsumePendingTwoFactorSetup(ctx context.Context, db *sql.DB, userID, token string) (string, error) {
+	tokenHash := sha256.Sum256([]byte(token))
+	now := time.Now().UTC().Unix()
+
+	row := db.QueryRowContext(ctx, `
+		SELECT id, secret_encrypted
+		FROM user_totp_pending_setups
+		WHERE user_id = ? AND token_hash = ? AND expires_at > ?
+	`, userID, tokenHash[:], now)
+
+	var setupID string
+	var secretEncrypted string
+	if err := row.Scan(&setupID, &secretEncrypted); err != nil {
+		return "", err
+	}
+
+	if _, err := db.ExecContext(ctx,
+		"DELETE FROM user_totp_pending_setups WHERE id = ?",
+		setupID,
+	); err != nil {
+		return "", err
+	}
+
+	return DecryptValue(secretEncrypted)
+}
 func CreateRecoveryCodes(ctx context.Context, db *sql.DB, userID string, count int) ([]string, error) {
 	if count <= 0 {
 		count = 8
@@ -213,7 +329,7 @@ func ConsumeRecoveryCode(ctx context.Context, db *sql.DB, userID, code string) (
 }
 ```
 
-Store `secret_encrypted` with your app's encryption helper (for example AES-GCM with a server-side key).
+This flow encrypts TOTP secrets before database writes and never puts the raw secret in browser-visible state.
 
 ## Setup handlers
 
@@ -224,7 +340,6 @@ package handlers
 
 import (
 	"database/sql"
-	"net/url"
 	"net/http"
 	"time"
 
@@ -245,12 +360,21 @@ func HandleTwoFactorSetupStart(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// Persist encrypted key.Secret() in a short-lived pending setup store
-		// tied to user/session (implementation-specific).
+		setupToken, err := auth.CreatePendingTwoFactorSetup(
+			r.Context(),
+			db,
+			session.UserID,
+			key.Secret(),
+			10*time.Minute,
+		)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
 
 		http.SetCookie(w, &http.Cookie{
-			Name:     "pending_2fa_secret",
-			Value:    key.Secret(), // demo only; encrypt/sign in real app
+			Name:     "pending_2fa_setup",
+			Value:    setupToken,
 			Path:     "/",
 			HttpOnly: true,
 			Secure:   true,
@@ -258,7 +382,7 @@ func HandleTwoFactorSetupStart(db *sql.DB) http.HandlerFunc {
 			MaxAge:   int((10 * time.Minute).Seconds()),
 		})
 
-		http.Redirect(w, r, "/2fa/setup?otpauth="+url.QueryEscape(key.URL()), http.StatusSeeOther)
+		http.Redirect(w, r, "/2fa/setup", http.StatusSeeOther)
 	}
 }
 
@@ -271,32 +395,42 @@ func HandleTwoFactorSetupConfirm(db *sql.DB) http.HandlerFunc {
 		}
 
 		code := r.FormValue("code")
-		c, err := r.Cookie("pending_2fa_secret")
+		c, err := r.Cookie("pending_2fa_setup")
 		if err != nil || code == "" {
 			http.Error(w, "Invalid setup state", http.StatusBadRequest)
 			return
 		}
+		secret, err := auth.ConsumePendingTwoFactorSetup(r.Context(), db, session.UserID, c.Value)
+		if err != nil {
+			http.Error(w, "Invalid setup state", http.StatusBadRequest)
+			return
+		}
 
-		if !auth.VerifyTOTPCode(c.Value, code, time.Now().UTC()) {
+		if !auth.VerifyTOTPCode(secret, code, time.Now().UTC()) {
 			http.Error(w, "Invalid code", http.StatusBadRequest)
 			return
 		}
 
-		// Save encrypted secret to user_totp_credentials (upsert).
-		// Then generate and show recovery codes once.
+		if err := auth.UpsertUserTOTPSecret(r.Context(), db, session.UserID, secret); err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
 		recoveryCodes, err := auth.CreateRecoveryCodes(r.Context(), db, session.UserID, 8)
 		if err != nil {
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
 
-		http.SetCookie(w, &http.Cookie{Name: "pending_2fa_secret", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+		http.SetCookie(w, &http.Cookie{Name: "pending_2fa_setup", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 
 		_ = recoveryCodes // render on a one-time page
 		http.Redirect(w, r, "/settings/security?two_factor=enabled", http.StatusSeeOther)
 	}
 }
 ```
+
+Render `/2fa/setup` server-side: load the pending setup token from cookie, decrypt the pending secret on the server, and generate the QR/otpauth payload there. Do not put `otpauth://` data in query params.
 
 ## Challenge handler (after login)
 
@@ -320,8 +454,11 @@ func HandleTwoFactorChallenge(db *sql.DB) http.HandlerFunc {
 
 		valid := false
 		if code != "" {
-			// Load and decrypt user's TOTP secret from user_totp_credentials.
-			secret := "..."
+			secret, err := auth.LoadUserTOTPSecret(r.Context(), db, session.UserID)
+			if err != nil {
+				http.Error(w, "Internal error", http.StatusInternalServerError)
+				return
+			}
 			valid = auth.VerifyTOTPCode(secret, code, time.Now().UTC())
 		}
 		if !valid && recoveryCode != "" {
