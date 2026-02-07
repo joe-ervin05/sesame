@@ -197,11 +197,19 @@ func VerifyEmailCode(ctx context.Context, db *sql.DB, userID, code string) error
 		return ErrInvalidCode // email changed since code was issued
 	}
 
+	// Invalidate all sessions so every device re-authenticates
+	_, err = tx.ExecContext(ctx, "DELETE FROM sessions WHERE user_id = ?", userID)
+	if err != nil {
+		return err
+	}
+
 	return tx.Commit()
 }
 ```
 
 This uses `DELETE ... RETURNING` to consume the code atomically. If your SQL dialect does not support `RETURNING`, do the lookup and delete in a transaction with row locking.
+
+After successful email verification, revoke all sessions for that user. This forces fresh authentication with the new verified account state on every device.
 
 ### Verification handlers
 
@@ -284,7 +292,7 @@ func HandleVerifyEmail(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+		http.Redirect(w, r, "/login?verified=1", http.StatusSeeOther)
 	}
 }
 ```
@@ -680,7 +688,7 @@ func ChangePassword(ctx context.Context, db *sql.DB, userID, currentPassword, ne
 Requiring the current password protects against session hijacking. If someone steals a session, they can't lock the real user out by changing the password.
 
 Flow checklist:
-1. Send a verification code and mark email verified after successful code confirmation
+1. Send a verification code, mark email verified after successful code confirmation, and revoke all active sessions
 2. Accept forgot-password requests with the same response regardless of account existence
 3. Consume reset tokens atomically, then rotate password hash and revoke all sessions
 4. Require current password for authenticated password changes and revoke all sessions after change
