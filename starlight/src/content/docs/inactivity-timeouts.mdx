@@ -7,4 +7,248 @@ import LLMExport from '../../components/LLMExport.astro';
 
 <LLMExport title="Inactivity Timeouts" slug="inactivity-timeouts" />
 
-Coming soon...
+This builds on [Users & Sessions](/users-sessions). You'll replace fixed session expiration with an inactivity timeout so active users stay signed in.
+
+## Before you start
+
+- Go 1.22+
+- Working server-side sessions from [Users & Sessions](/users-sessions)
+- Cookie-based auth middleware already in place
+
+## File layout
+
+You only need to update session and cookie logic:
+
+```
+ /auth
+  /sessions.go      // inactivity timeout by last_verified_at
+  /cookies.go       // MaxAge from SessionInactivityTimeout
+  /middleware.go
+ /main.go
+```
+
+## Why inactivity timeout
+
+A fixed expiration signs users out even when they are actively using the app.
+
+Inactivity timeout keeps users signed in while active, and only expires sessions that have not been used recently.
+
+## Update the session model
+
+Track when a session was last verified:
+
+```go
+type Session struct {
+	ID             string
+	SecretHash     []byte
+	UserID         string
+	LastVerifiedAt time.Time
+	CreatedAt      time.Time
+}
+```
+
+## Update the sessions table
+
+Add `last_verified_at` to the sessions table:
+
+```diff
+ CREATE TABLE sessions (
+     id TEXT NOT NULL PRIMARY KEY,
+     secret_hash BLOB NOT NULL,
+     user_id TEXT NOT NULL REFERENCES users(id),
++    last_verified_at INTEGER NOT NULL,
+     created_at INTEGER NOT NULL
+ );
+```
+
+## Create session
+
+Put this in `auth/sessions.go`.
+
+```go
+const SessionInactivityTimeout = 10 * 24 * time.Hour
+const SessionActivityCheckInterval = time.Hour
+
+func CreateSession(ctx context.Context, db *sql.DB, userID string) (token string, err error) {
+	id, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	secret, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	secretHash := hashSecret(secret)
+	now := time.Now().UTC()
+
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO sessions (id, secret_hash, user_id, last_verified_at, created_at) VALUES (?, ?, ?, ?, ?)",
+		id, secretHash, userID, now.Unix(), now.Unix(),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return id + "." + secret, nil
+}
+```
+
+## Validate session with inactivity timeout
+
+Put this in `auth/sessions.go`.
+
+```go
+import (
+	"context"
+	"crypto/subtle"
+	"database/sql"
+	"errors"
+	"strings"
+	"time"
+)
+
+func ValidateSession(ctx context.Context, db *sql.DB, token string) (session *Session, shouldRefresh bool, err error) {
+	parts := strings.SplitN(token, ".", 2)
+	if len(parts) != 2 {
+		return nil, false, ErrInvalidSession
+	}
+
+	sessionID, secret := parts[0], parts[1]
+	if len(sessionID) != sessionTokenPartLength || len(secret) != sessionTokenPartLength {
+		return nil, false, ErrInvalidSession
+	}
+
+	session, err = getSession(ctx, db, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	if session == nil {
+		return nil, false, ErrInvalidSession
+	}
+
+	secretHash := hashSecret(secret)
+	if subtle.ConstantTimeCompare(secretHash, session.SecretHash) != 1 {
+		return nil, false, ErrInvalidSession
+	}
+
+	now := time.Now().UTC()
+	if now.Sub(session.LastVerifiedAt) >= SessionInactivityTimeout {
+		_ = DeleteSession(ctx, db, sessionID)
+		return nil, false, ErrInvalidSession
+	}
+
+	if now.Sub(session.LastVerifiedAt) >= SessionActivityCheckInterval {
+		err = updateSessionLastVerifiedAt(ctx, db, sessionID, now)
+		if err != nil {
+			return nil, false, err
+		}
+		session.LastVerifiedAt = now
+		shouldRefresh = true
+	}
+
+	return session, shouldRefresh, nil
+}
+
+func getSession(ctx context.Context, db *sql.DB, sessionID string) (*Session, error) {
+	row := db.QueryRowContext(ctx,
+		"SELECT id, secret_hash, user_id, last_verified_at, created_at FROM sessions WHERE id = ?",
+		sessionID,
+	)
+
+	var session Session
+	var lastVerifiedAt int64
+	var createdAt int64
+	err := row.Scan(&session.ID, &session.SecretHash, &session.UserID, &lastVerifiedAt, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	session.LastVerifiedAt = time.Unix(lastVerifiedAt, 0).UTC()
+	session.CreatedAt = time.Unix(createdAt, 0).UTC()
+	return &session, nil
+}
+
+func updateSessionLastVerifiedAt(ctx context.Context, db *sql.DB, sessionID string, now time.Time) error {
+	_, err := db.ExecContext(ctx,
+		"UPDATE sessions SET last_verified_at = ? WHERE id = ?",
+		now.Unix(), sessionID,
+	)
+	return err
+}
+```
+
+Only update `last_verified_at` at a fixed interval (for example once per hour), not on every request.
+
+## Refresh cookie when activity is recorded
+
+Put this in `auth/cookies.go`.
+
+```go
+func SetSessionCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(SessionInactivityTimeout.Seconds()),
+		HttpOnly: true,
+		Secure:   true, // set to false for local testing over plain HTTP
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+```
+
+Now update middleware to refresh the cookie only when `last_verified_at` is updated.
+
+Put this in `auth/middleware.go`.
+
+```go
+func SessionMiddleware(db *sql.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := GetSessionToken(r)
+			if token == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			session, shouldRefresh, err := ValidateSession(r.Context(), db, token)
+			if err != nil {
+				ClearSessionCookie(w)
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if shouldRefresh {
+				SetSessionCookie(w, token)
+			}
+
+			ctx := context.WithValue(r.Context(), sessionContextKey, session)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+```
+
+Request flow:
+1. Read session token from cookie
+2. Validate token and secret
+3. Expire inactive sessions
+4. Update `last_verified_at` only at the check interval
+5. Refresh cookie only when activity timestamp was updated
+
+## Recommended values
+
+- `SessionInactivityTimeout`: 7 to 30 days (10 days is a common default)
+- `SessionActivityCheckInterval`: 15 minutes to 2 hours (1 hour is a good default)
+- Keep `SessionActivityCheckInterval` lower than `SessionInactivityTimeout`
+
+Shorter timeout = stronger security, longer timeout = fewer logins.
+
+## Next up
+
+Head to [2FA](/2fa) to add two-factor authentication.
