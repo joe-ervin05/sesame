@@ -9,14 +9,14 @@ import LLMExport from '../../components/LLMExport.astro';
 
 Sesame is a guide for implementing authentication with Go and SQL. It's inspired by [Lucia Auth](https://lucia-auth.com), which does the same thing for JavaScript.
 
-You start with users and sessions, then build up from there. Each section adds one piece: email/password login, rate limiting, inactivity timeouts, OAuth, 2FA, and passkeys. By the end, you have a complete auth system you understand and control.
+You start with users and server-side sessions, then build up to a full production-ready auth system: password login, verification and recovery, rate limiting, inactivity timeouts, OAuth with PKCE, TOTP 2FA, and passkeys.
 
 ## What you get
 
-- SQL schemas you can copy and modify
-- Working code for each auth feature
-- A reference server using net/http
-- Patterns for email/password, OAuth, TOTP, and WebAuthn
+- SQL schemas and query patterns you can copy
+- Working code for each auth layer
+- A reference implementation style based on `net/http`
+- Security-focused defaults for cookies, CSRF, token handling, encryption, and abuse prevention
 
 ## What this isn't
 
@@ -49,12 +49,14 @@ The database lookup on each request is usually not a problem. You're probably al
 
 Work through the sections in order. Each one builds on the previous:
 
-1. **Users & Sessions** - The foundation. User table, session tokens, and validation.
-2. **Email & Password** - Signup, login, and password hashing.
-3. **Rate Limiting** - Protect your login endpoint from brute force.
-4. **Inactivity Timeouts** - Expire sessions after periods of no activity.
-5. **OAuth** - Let users sign in with GitHub, Google, etc.
-6. **2FA** - Add TOTP-based second factor.
-7. **Passkeys** - WebAuthn for passwordless login.
+1. **Users & Sessions** - Foundation for secure server-side auth.
+2. **Password Signup/Login** - Signup/login flow with secure password handling.
+3. **Email/Password** - Additional email/password patterns and hardening.
+4. **Verification & Recovery** - Email verification and account recovery flows.
+5. **Rate Limiting** - Brute-force and abuse protection patterns.
+6. **Inactivity Timeouts** - Session idle expiry and renewal behavior.
+7. **OAuth** - Authorization Code flow with PKCE and secure callback handling.
+8. **2FA** - TOTP enrollment, encrypted secret storage, and recovery codes.
+9. **Passkeys** - WebAuthn registration and authentication.
 
-The code uses Go's standard library where possible. For Random IDs, OAuth and WebAuthn, we use [nanoid](https://github.com/matoous/go-nanoid) [Goth](https://github.com/markbates/goth) and [go-webauthn](https://github.com/go-webauthn/webauthn).
+The guide uses Go's standard library where possible. For focused areas, it uses [go-nanoid](https://github.com/matoous/go-nanoid), `golang.org/x/oauth2`, [pquerna/otp](https://github.com/pquerna/otp), and [go-webauthn](https://github.com/go-webauthn/webauthn).
