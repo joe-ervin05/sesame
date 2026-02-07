@@ -7,4 +7,585 @@ import LLMExport from '../../components/LLMExport.astro';
 
 <LLMExport title="Passkeys" slug="passkeys" />
 
-Coming soon...
+This builds on [Users & Sessions](/users-sessions). You'll add WebAuthn passkeys for phishing-resistant login using [go-webauthn](https://github.com/go-webauthn/webauthn).
+
+## Before you start
+
+- Go 1.22+
+- Existing session middleware and cookie helpers
+- HTTPS in non-local environments (WebAuthn requires secure contexts)
+- `github.com/go-webauthn/webauthn/webauthn`
+
+Use a `go-webauthn` version compatible with your Go toolchain.
+
+## File layout
+
+```diff
+ /auth
+   /sessions.go
+   /cookies.go
++  /passkeys.go        // relying party config + credential persistence
+ /handlers
++  /passkeys.go        // begin/finish handlers
++  /pages.go           // passkey setup/login pages
+ /main.go
+```
+
+## Data model
+
+Store each credential for each user, plus short-lived ceremony session data between begin/finish calls.
+
+```sql
+CREATE TABLE user_passkeys (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    credential_id BLOB NOT NULL UNIQUE,
+    credential_json BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX user_passkeys_user_id_idx ON user_passkeys(user_id);
+
+CREATE TABLE webauthn_flows (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT,
+    flow_type TEXT NOT NULL,
+    session_data_json BLOB NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX webauthn_flows_expires_at_idx ON webauthn_flows(expires_at);
+```
+
+## Configure the relying party
+
+Put this in `auth/passkeys.go`.
+
+```go
+package auth
+
+import (
+	"os"
+
+	"github.com/go-webauthn/webauthn/webauthn"
+)
+
+func NewWebAuthn() (*webauthn.WebAuthn, error) {
+	return webauthn.New(&webauthn.Config{
+		RPDisplayName: "Sesame",
+		RPID:          os.Getenv("WEBAUTHN_RP_ID"),
+		RPOrigins:     []string{os.Getenv("WEBAUTHN_RP_ORIGIN")},
+	})
+}
+```
+
+Environment variables:
+- `WEBAUTHN_RP_ID` (for example `localhost` in dev, `app.example.com` in prod)
+- `WEBAUTHN_RP_ORIGIN` (for example `http://localhost:8080` in dev)
+
+## User adapter + persistence
+
+Put this in `auth/passkeys.go`.
+
+```go
+package auth
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/go-webauthn/webauthn/webauthn"
+	gonanoid "github.com/matoous/go-nanoid/v2"
+)
+
+type WebAuthnUser struct {
+	ID          string
+	Email       string
+	DisplayName string
+	Credentials []webauthn.Credential
+}
+
+func (u *WebAuthnUser) WebAuthnID() []byte {
+	return []byte(u.ID)
+}
+
+func (u *WebAuthnUser) WebAuthnName() string {
+	return u.Email
+}
+
+func (u *WebAuthnUser) WebAuthnDisplayName() string {
+	if u.DisplayName != "" {
+		return u.DisplayName
+	}
+	return u.Email
+}
+
+func (u *WebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
+	return u.Credentials
+}
+
+func (u *WebAuthnUser) WebAuthnIcon() string {
+	return ""
+}
+
+func GetWebAuthnUserByID(ctx context.Context, db *sql.DB, userID string) (*WebAuthnUser, error) {
+	row := db.QueryRowContext(ctx, "SELECT id, email FROM users WHERE id = ?", userID)
+
+	var u WebAuthnUser
+	if err := row.Scan(&u.ID, &u.Email); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	credentials, err := ListUserPasskeys(ctx, db, u.ID)
+	if err != nil {
+		return nil, err
+	}
+	u.Credentials = credentials
+
+	return &u, nil
+}
+
+func ListUserPasskeys(ctx context.Context, db *sql.DB, userID string) ([]webauthn.Credential, error) {
+	rows, err := db.QueryContext(ctx,
+		"SELECT credential_json FROM user_passkeys WHERE user_id = ?",
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]webauthn.Credential, 0)
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+
+		var c webauthn.Credential
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+
+	return out, rows.Err()
+}
+
+func SaveUserPasskey(ctx context.Context, db *sql.DB, userID string, c *webauthn.Credential) error {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	id, err := gonanoid.New()
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC().Unix()
+
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO user_passkeys (id, user_id, credential_id, credential_json, created_at) VALUES (?, ?, ?, ?, ?)",
+		id, userID, c.ID, raw, now,
+	)
+	return err
+}
+
+func UpdateUserPasskey(ctx context.Context, db *sql.DB, c *webauthn.Credential) error {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx,
+		"UPDATE user_passkeys SET credential_json = ? WHERE credential_id = ?",
+		raw, c.ID,
+	)
+	return err
+}
+```
+
+## WebAuthn flow state storage
+
+Put this in `auth/passkeys.go`.
+
+```go
+type WebAuthnFlow struct {
+	ID          string
+	UserID      *string
+	FlowType    string
+	SessionData webauthn.SessionData
+	ExpiresAt   time.Time
+}
+
+const (
+	FlowTypeRegister = "register"
+	FlowTypeLogin    = "login"
+	WebAuthnFlowTTL  = 10 * time.Minute
+)
+
+func CreateWebAuthnFlow(ctx context.Context, db *sql.DB, flowType string, userID *string, session *webauthn.SessionData) (string, error) {
+	raw, err := json.Marshal(session)
+	if err != nil {
+		return "", err
+	}
+
+	id, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(WebAuthnFlowTTL)
+
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO webauthn_flows (id, user_id, flow_type, session_data_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		id, userID, flowType, raw, expiresAt.Unix(), now.Unix(),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return id, nil
+}
+
+func ConsumeWebAuthnFlow(ctx context.Context, db *sql.DB, flowID, flowType string) (*WebAuthnFlow, error) {
+	row := db.QueryRowContext(ctx,
+		"SELECT user_id, session_data_json, expires_at FROM webauthn_flows WHERE id = ? AND flow_type = ?",
+		flowID, flowType,
+	)
+
+	var userID sql.NullString
+	var raw []byte
+	var expiresAtUnix int64
+	if err := row.Scan(&userID, &raw, &expiresAtUnix); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	_, _ = db.ExecContext(ctx, "DELETE FROM webauthn_flows WHERE id = ?", flowID)
+
+	flow := &WebAuthnFlow{ID: flowID, FlowType: flowType, ExpiresAt: time.Unix(expiresAtUnix, 0).UTC()}
+	if userID.Valid {
+		flow.UserID = &userID.String
+	}
+	if err := json.Unmarshal(raw, &flow.SessionData); err != nil {
+		return nil, err
+	}
+	if time.Now().UTC().After(flow.ExpiresAt) {
+		return nil, nil
+	}
+
+	return flow, nil
+}
+```
+
+## Begin/finish handlers
+
+Put this in `handlers/passkeys.go`.
+
+```go
+package handlers
+
+import (
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	auth "github.com/.../auth"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
+)
+
+func setWebAuthnFlowCookie(w http.ResponseWriter, flowID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "webauthn_flow",
+		Value:    flowID,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int((10 * time.Minute).Seconds()),
+	})
+}
+
+func clearWebAuthnFlowCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: "webauthn_flow", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+
+func HandlePasskeyRegisterBegin(wan *webauthn.WebAuthn, db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		user, err := auth.GetWebAuthnUserByID(r.Context(), db, session.UserID)
+		if err != nil || user == nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		creation, ws, err := wan.BeginMediatedRegistration(
+			user,
+			protocol.MediationDefault,
+			webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
+			webauthn.WithExclusions(webauthn.Credentials(user.WebAuthnCredentials()).CredentialDescriptors()),
+		)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		flowID, err := auth.CreateWebAuthnFlow(r.Context(), db, auth.FlowTypeRegister, &session.UserID, ws)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		setWebAuthnFlowCookie(w, flowID)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(creation)
+	}
+}
+
+func HandlePasskeyRegisterFinish(wan *webauthn.WebAuthn, db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		c, err := r.Cookie("webauthn_flow")
+		if err != nil {
+			http.Error(w, "Invalid flow", http.StatusBadRequest)
+			return
+		}
+		flow, err := auth.ConsumeWebAuthnFlow(r.Context(), db, c.Value, auth.FlowTypeRegister)
+		if err != nil || flow == nil || flow.UserID == nil || *flow.UserID != session.UserID {
+			http.Error(w, "Invalid flow", http.StatusBadRequest)
+			return
+		}
+
+		user, err := auth.GetWebAuthnUserByID(r.Context(), db, session.UserID)
+		if err != nil || user == nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		credential, err := wan.FinishRegistration(user, flow.SessionData, r)
+		if err != nil {
+			http.Error(w, "Registration failed", http.StatusBadRequest)
+			return
+		}
+
+		if err := auth.SaveUserPasskey(r.Context(), db, session.UserID, credential); err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		clearWebAuthnFlowCookie(w)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func HandlePasskeyLoginBegin(wan *webauthn.WebAuthn, db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		assertion, ws, err := wan.BeginDiscoverableMediatedLogin(protocol.MediationConditional)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		flowID, err := auth.CreateWebAuthnFlow(r.Context(), db, auth.FlowTypeLogin, nil, ws)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		setWebAuthnFlowCookie(w, flowID)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(assertion)
+	}
+}
+
+func HandlePasskeyLoginFinish(wan *webauthn.WebAuthn, db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("webauthn_flow")
+		if err != nil {
+			http.Error(w, "Invalid flow", http.StatusBadRequest)
+			return
+		}
+		flow, err := auth.ConsumeWebAuthnFlow(r.Context(), db, c.Value, auth.FlowTypeLogin)
+		if err != nil || flow == nil {
+			http.Error(w, "Invalid flow", http.StatusBadRequest)
+			return
+		}
+
+		loadUser := func(rawID, userHandle []byte) (webauthn.User, error) {
+			userID := string(userHandle)
+			return auth.GetWebAuthnUserByID(r.Context(), db, userID)
+		}
+
+		user, credential, err := wan.FinishPasskeyLogin(loadUser, flow.SessionData, r)
+		if err != nil {
+			http.Error(w, "Passkey login failed", http.StatusUnauthorized)
+			return
+		}
+
+		u, ok := user.(*auth.WebAuthnUser)
+		if !ok {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		if err := auth.UpdateUserPasskey(r.Context(), db, credential); err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		token, err := auth.CreateSession(r.Context(), db, u.ID)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		clearWebAuthnFlowCookie(w)
+		auth.SetSessionCookie(w, token)
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	}
+}
+```
+
+## Browser page and JS
+
+Put this in `handlers/pages.go`.
+
+```go
+func HandlePasskeysPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <body>
+    <h1>Passkeys</h1>
+    <button id="register">Register passkey</button>
+    <button id="login">Sign in with passkey</button>
+
+    <script>
+      function b64ToBytes(base64url) {
+        const pad = '='.repeat((4 - (base64url.length % 4)) % 4)
+        const base64 = (base64url + pad).replace(/-/g, '+').replace(/_/g, '/')
+        const raw = atob(base64)
+        return Uint8Array.from(raw, c => c.charCodeAt(0))
+      }
+
+      function bytesToB64(bytes) {
+        let s = ''
+        bytes.forEach(b => s += String.fromCharCode(b))
+        return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+      }
+
+      async function registerPasskey() {
+        const begin = await fetch('/passkeys/register/begin', { method: 'POST' })
+        const options = await begin.json()
+
+        options.publicKey.challenge = b64ToBytes(options.publicKey.challenge)
+        options.publicKey.user.id = b64ToBytes(options.publicKey.user.id)
+        if (options.publicKey.excludeCredentials) {
+          options.publicKey.excludeCredentials = options.publicKey.excludeCredentials.map(c => ({ ...c, id: b64ToBytes(c.id) }))
+        }
+
+        const cred = await navigator.credentials.create({ publicKey: options.publicKey })
+        const payload = {
+          id: cred.id,
+          rawId: bytesToB64(new Uint8Array(cred.rawId)),
+          type: cred.type,
+          response: {
+            attestationObject: bytesToB64(new Uint8Array(cred.response.attestationObject)),
+            clientDataJSON: bytesToB64(new Uint8Array(cred.response.clientDataJSON)),
+          },
+        }
+
+        await fetch('/passkeys/register/finish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      }
+
+      async function loginWithPasskey() {
+        const begin = await fetch('/passkeys/login/begin', { method: 'POST' })
+        const options = await begin.json()
+
+        options.publicKey.challenge = b64ToBytes(options.publicKey.challenge)
+        if (options.publicKey.allowCredentials) {
+          options.publicKey.allowCredentials = options.publicKey.allowCredentials.map(c => ({ ...c, id: b64ToBytes(c.id) }))
+        }
+
+        const assertion = await navigator.credentials.get({ publicKey: options.publicKey, mediation: 'conditional' })
+        const payload = {
+          id: assertion.id,
+          rawId: bytesToB64(new Uint8Array(assertion.rawId)),
+          type: assertion.type,
+          response: {
+            authenticatorData: bytesToB64(new Uint8Array(assertion.response.authenticatorData)),
+            clientDataJSON: bytesToB64(new Uint8Array(assertion.response.clientDataJSON)),
+            signature: bytesToB64(new Uint8Array(assertion.response.signature)),
+            userHandle: assertion.response.userHandle ? bytesToB64(new Uint8Array(assertion.response.userHandle)) : null,
+          },
+        }
+
+        const res = await fetch('/passkeys/login/finish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+        if (res.redirected) location.href = res.url
+      }
+
+      document.getElementById('register').addEventListener('click', registerPasskey)
+      document.getElementById('login').addEventListener('click', loginWithPasskey)
+    </script>
+  </body>
+</html>`))
+}
+```
+
+## Route wiring
+
+Put this in `main.go`.
+
+```go
+wan, err := auth.NewWebAuthn()
+if err != nil {
+	panic(err)
+}
+
+mux.Handle("GET /passkeys", auth.RequirePrimarySession(http.HandlerFunc(handlers.HandlePasskeysPage)))
+
+mux.Handle("POST /passkeys/register/begin", requireSameOrigin(auth.RequirePrimarySession(handlers.HandlePasskeyRegisterBegin(wan, db))))
+mux.Handle("POST /passkeys/register/finish", requireSameOrigin(auth.RequirePrimarySession(handlers.HandlePasskeyRegisterFinish(wan, db))))
+
+mux.Handle("POST /passkeys/login/begin", requireSameOrigin(http.HandlerFunc(handlers.HandlePasskeyLoginBegin(wan, db))))
+mux.Handle("POST /passkeys/login/finish", requireSameOrigin(http.HandlerFunc(handlers.HandlePasskeyLoginFinish(wan, db))))
+```
+
+## Notes
+
+- WebAuthn requires exact origin and RP ID matching; mismatches are the most common setup issue.
+- Keep WebAuthn flow sessions short-lived and single-use (as shown).
+- Rate-limit begin/finish endpoints with the token bucket middleware from [Rate Limiting](/rate-limiting).
+
+## Next up
+
+You now have sessions, password/OAuth, 2FA, and passkeys. Add app-specific hardening and audit logging as needed.
