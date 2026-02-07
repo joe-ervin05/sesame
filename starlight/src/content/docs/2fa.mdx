@@ -7,4 +7,429 @@ import LLMExport from '../../components/LLMExport.astro';
 
 <LLMExport title="2FA" slug="2fa" />
 
-Coming soon...
+This builds on [Users & Sessions](/users-sessions) and works with either password or OAuth login. You'll add TOTP-based two-factor authentication with recovery codes.
+
+## Before you start
+
+- Go 1.22+
+- Existing primary auth flow (password, OAuth, or both)
+- Existing server-side sessions
+- Our TOTP library: `github.com/pquerna/otp` 
+
+## File layout
+
+```diff
+ /auth
+   /sessions.go
++  /two_factor.go      // TOTP + recovery code logic
+ /handlers
++  /two_factor.go      // setup + challenge handlers
++  /pages.go           // 2FA setup/challenge pages
+ /main.go
+```
+
+## Data model
+
+Store one TOTP credential per user and separate one-time recovery codes.
+
+```sql
+CREATE TABLE user_totp_credentials (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+    secret_encrypted TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE user_recovery_codes (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    code_hash BLOB NOT NULL,
+    used_at INTEGER,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX user_recovery_codes_user_id_idx ON user_recovery_codes(user_id);
+```
+
+## Session auth levels
+
+Use session auth levels so primary auth and full 2FA auth are distinct.
+
+Put this in `auth/sessions.go`:
+
+```go
+const (
+	SessionAuthLevelPrimary = 1
+	SessionAuthLevelFull    = 2
+)
+
+type Session struct {
+	ID         string
+	SecretHash []byte
+	UserID     string
+	AuthLevel int
+	CreatedAt time.Time
+}
+
+func CreateSession(ctx context.Context, db *sql.DB, userID string, authLevel int) (string, error) {
+	id, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	secret, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC().Unix()
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO sessions (id, secret_hash, user_id, auth_level, created_at) VALUES (?, ?, ?, ?, ?)",
+		id, hashSecret(secret), userID, authLevel, now,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return id + "." + secret, nil
+}
+
+func UpgradeSessionToFull(ctx context.Context, db *sql.DB, sessionID string) error {
+	_, err := db.ExecContext(ctx,
+		"UPDATE sessions SET auth_level = ? WHERE id = ?",
+		SessionAuthLevelFull, sessionID,
+	)
+	return err
+}
+```
+
+When primary auth succeeds:
+- if user has no TOTP credential: create full session
+- if user has TOTP enabled: create primary session and redirect to `/2fa/challenge`
+
+## TOTP and recovery code logic
+
+Put this in `auth/two_factor.go`:
+
+```go
+package auth
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/pquerna/otp"
+	"github.com/pquerna/otp/totp"
+	gonanoid "github.com/matoous/go-nanoid/v2"
+)
+
+var ErrInvalidTwoFactorCode = errors.New("invalid two-factor code")
+
+func HasTwoFactorEnabled(ctx context.Context, db *sql.DB, userID string) (bool, error) {
+	row := db.QueryRowContext(ctx,
+		"SELECT 1 FROM user_totp_credentials WHERE user_id = ?",
+		userID,
+	)
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func GenerateTOTPSetup(secretLabel, issuer string) (*otp.Key, error) {
+	return totp.Generate(totp.GenerateOpts{
+		Issuer:      issuer,
+		AccountName: secretLabel,
+		Period:      30,
+		Digits:      otp.DigitsSix,
+		Algorithm:   otp.AlgorithmSHA1,
+	})
+}
+
+func VerifyTOTPCode(secret, code string, now time.Time) bool {
+	return totp.ValidateCustom(code, secret, now,
+		totp.ValidateOpts{Period: 30, Skew: 1, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1},
+	)
+}
+
+func CreateRecoveryCodes(ctx context.Context, db *sql.DB, userID string, count int) ([]string, error) {
+	if count <= 0 {
+		count = 8
+	}
+
+	_, err := db.ExecContext(ctx, "DELETE FROM user_recovery_codes WHERE user_id = ?", userID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC().Unix()
+	plain := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		codeID, _ := gonanoid.New()
+		codeRaw, _ := gonanoid.Generate("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", 10)
+		code := strings.ToUpper(codeRaw)
+		hash := sha256.Sum256([]byte(code))
+
+		_, err = db.ExecContext(ctx,
+			"INSERT INTO user_recovery_codes (id, user_id, code_hash, created_at) VALUES (?, ?, ?, ?)",
+			codeID, userID, hash[:], now,
+		)
+		if err != nil {
+			return nil, err
+		}
+		plain = append(plain, fmt.Sprintf("%s-%s", code[:5], code[5:]))
+	}
+
+	return plain, nil
+}
+
+func ConsumeRecoveryCode(ctx context.Context, db *sql.DB, userID, code string) (bool, error) {
+	normalized := strings.ToUpper(strings.ReplaceAll(code, "-", ""))
+	h := sha256.Sum256([]byte(normalized))
+	now := time.Now().UTC().Unix()
+
+	result, err := db.ExecContext(ctx,
+		"UPDATE user_recovery_codes SET used_at = ? WHERE user_id = ? AND code_hash = ? AND used_at IS NULL",
+		now, userID, h[:],
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
+}
+```
+
+Store `secret_encrypted` with your app's encryption helper (for example AES-GCM with a server-side key).
+
+## Setup handlers
+
+Put this in `handlers/two_factor.go`:
+
+```go
+package handlers
+
+import (
+	"database/sql"
+	"net/url"
+	"net/http"
+	"time"
+
+	auth "github.com/.../auth"
+)
+
+func HandleTwoFactorSetupStart(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+
+		key, err := auth.GenerateTOTPSetup(session.UserID, "Sesame")
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		// Persist encrypted key.Secret() in a short-lived pending setup store
+		// tied to user/session (implementation-specific).
+
+		http.SetCookie(w, &http.Cookie{
+			Name:     "pending_2fa_secret",
+			Value:    key.Secret(), // demo only; encrypt/sign in real app
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int((10 * time.Minute).Seconds()),
+		})
+
+		http.Redirect(w, r, "/2fa/setup?otpauth="+url.QueryEscape(key.URL()), http.StatusSeeOther)
+	}
+}
+
+func HandleTwoFactorSetupConfirm(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+
+		code := r.FormValue("code")
+		c, err := r.Cookie("pending_2fa_secret")
+		if err != nil || code == "" {
+			http.Error(w, "Invalid setup state", http.StatusBadRequest)
+			return
+		}
+
+		if !auth.VerifyTOTPCode(c.Value, code, time.Now().UTC()) {
+			http.Error(w, "Invalid code", http.StatusBadRequest)
+			return
+		}
+
+		// Save encrypted secret to user_totp_credentials (upsert).
+		// Then generate and show recovery codes once.
+		recoveryCodes, err := auth.CreateRecoveryCodes(r.Context(), db, session.UserID, 8)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		http.SetCookie(w, &http.Cookie{Name: "pending_2fa_secret", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+
+		_ = recoveryCodes // render on a one-time page
+		http.Redirect(w, r, "/settings/security?two_factor=enabled", http.StatusSeeOther)
+	}
+}
+```
+
+## Challenge handler (after login)
+
+Put this in `handlers/two_factor.go`:
+
+```go
+func HandleTwoFactorChallenge(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		session := auth.GetSession(r.Context())
+		if session == nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		if session.AuthLevel == auth.SessionAuthLevelFull {
+			http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+			return
+		}
+
+		code := r.FormValue("code")
+		recoveryCode := r.FormValue("recovery_code")
+
+		valid := false
+		if code != "" {
+			// Load and decrypt user's TOTP secret from user_totp_credentials.
+			secret := "..."
+			valid = auth.VerifyTOTPCode(secret, code, time.Now().UTC())
+		}
+		if !valid && recoveryCode != "" {
+			ok, err := auth.ConsumeRecoveryCode(r.Context(), db, session.UserID, recoveryCode)
+			if err != nil {
+				http.Error(w, "Internal error", http.StatusInternalServerError)
+				return
+			}
+			valid = ok
+		}
+
+		if !valid {
+			http.Error(w, "Invalid code", http.StatusUnauthorized)
+			return
+		}
+
+		if err := auth.UpgradeSessionToFull(r.Context(), db, session.ID); err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	}
+}
+```
+
+## Middleware and route checks
+
+Put this in `auth/middleware.go`:
+
+```go
+func RequirePrimarySession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if GetSession(r.Context()) == nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func RequireFullSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := GetSession(r.Context())
+		if s == nil || s.AuthLevel != SessionAuthLevelFull {
+			http.Redirect(w, r, "/2fa/challenge", http.StatusSeeOther)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+## Route wiring
+
+Put this in `main.go`:
+
+```go
+// Setup (already logged in)
+mux.Handle("POST /settings/2fa/setup/start", requireSameOrigin(auth.RequireFullSession(handlers.HandleTwoFactorSetupStart(db))))
+mux.Handle("POST /settings/2fa/setup/confirm", requireSameOrigin(auth.RequireFullSession(handlers.HandleTwoFactorSetupConfirm(db))))
+
+// Challenge after primary login
+mux.Handle("GET /2fa/challenge", auth.RequirePrimarySession(http.HandlerFunc(handlers.HandleTwoFactorChallengePage)))
+mux.Handle("POST /2fa/challenge", requireSameOrigin(auth.RequirePrimarySession(handlers.HandleTwoFactorChallenge(db))))
+
+// Protect app routes with full session
+mux.Handle("GET /dashboard", auth.RequireFullSession(http.HandlerFunc(handleDashboard)))
+```
+
+## Rendering pages
+
+Put this in `handlers/pages.go`:
+
+```go
+func HandleTwoFactorChallengePage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <body>
+    <h1>Two-factor authentication</h1>
+    <form method="post" action="/2fa/challenge">
+      <label>Authenticator code <input name="code" inputmode="numeric" /></label><br />
+      <label>Recovery code <input name="recovery_code" /></label><br />
+      <button type="submit">Continue</button>
+    </form>
+  </body>
+</html>`))
+}
+```
+
+Your security settings page can start setup with a simple form:
+
+```html
+<form method="post" action="/settings/2fa/setup/start">
+  <button type="submit">Enable 2FA</button>
+</form>
+```
+
+## Rate-limit 2FA routes
+
+Apply strict limits:
+- `POST /2fa/challenge`: key by user ID, low burst
+- `POST /settings/2fa/setup/confirm`: key by user ID
+
+Reuse the token-bucket middleware from [Rate Limiting](/rate-limiting).
+
+## Next up
+
+Head to [Passkeys](/passkeys) to add WebAuthn for phishing-resistant auth.
