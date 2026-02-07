@@ -7,7 +7,7 @@ import LLMExport from '../../components/LLMExport.astro';
 
 <LLMExport title="OAuth" slug="oauth" />
 
-This builds on [Users & Sessions](/users-sessions). You'll add OAuth login with [Goth](https://github.com/markbates/goth) using a provider-agnostic structure, then configure Google first.
+This builds on [Users & Sessions](/users-sessions). You'll add OAuth login using Authorization Code + PKCE with a provider-agnostic structure, then configure Google first.
 
 ## Before you start
 
@@ -24,6 +24,7 @@ This builds on [Users & Sessions](/users-sessions). You'll add OAuth login with 
    /cookies.go
    /middleware.go
 +  /oauth.go          // provider account linking + user creation
++  /oauth_pkce.go     // PKCE verifier + state cookie helpers
  /handlers
 +  /oauth.go          // oauth start + callback handlers
 +  /pages.go          // login page with oauth button
@@ -48,47 +49,25 @@ CREATE TABLE oauth_accounts (
 CREATE INDEX oauth_accounts_user_id_idx ON oauth_accounts(user_id);
 ```
 
-## Configure Goth and Google
+## Configure Google OAuth (PKCE)
 
 Put this in `main.go` startup:
 
 ```go
 import (
-	"errors"
-	"net/http"
 	"os"
 
-	"github.com/gorilla/sessions"
-	"github.com/markbates/goth"
-	"github.com/markbates/goth/gothic"
-	"github.com/markbates/goth/providers/google"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
-func configureOAuth() {
-	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
-	googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
-	googleCallbackURL := os.Getenv("GOOGLE_CALLBACK_URL")
-
-	goth.UseProviders(
-		google.New(googleClientID, googleClientSecret, googleCallbackURL, "email", "profile"),
-	)
-
-	store := sessions.NewCookieStore([]byte(os.Getenv("GOTH_SESSION_SECRET")))
-	store.Options.Path = "/"
-	store.Options.HttpOnly = true
-	store.Options.Secure = true // set to false for local testing over plain HTTP
-	store.Options.MaxAge = 300  // short-lived oauth session
-	gothic.Store = store
-
-	defaultGetProviderName := gothic.GetProviderName
-	gothic.GetProviderName = func(r *http.Request) (string, error) {
-		if provider := r.PathValue("provider"); provider != "" {
-			return provider, nil
-		}
-		if defaultGetProviderName != nil {
-			return defaultGetProviderName(r)
-		}
-		return "", errors.New("provider not found")
+func googleOAuthConfig() *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("GOOGLE_CALLBACK_URL"),
+		Scopes:       []string{"openid", "email", "profile"},
+		Endpoint:     google.Endpoint,
 	}
 }
 ```
@@ -97,7 +76,104 @@ Environment variables:
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_CALLBACK_URL`
-- `GOTH_SESSION_SECRET`
+- `OAUTH_STATE_SECRET`
+
+## PKCE + state helpers
+
+Put this in `auth/oauth_pkce.go`:
+
+```go
+package auth
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+const oauthStateCookieName = "oauth_state"
+
+func NewRandomURLSafe(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func PKCEChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func SignOAuthState(state, verifier string) (string, error) {
+	secret := os.Getenv("OAUTH_STATE_SECRET")
+	if secret == "" {
+		return "", errors.New("missing OAUTH_STATE_SECRET")
+	}
+	payload := state + "." + verifier
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return payload + "." + sig, nil
+}
+
+func VerifyOAuthStateCookie(raw string) (state string, verifier string, err error) {
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return "", "", errors.New("invalid oauth state cookie")
+	}
+	payload := parts[0] + "." + parts[1]
+	secret := os.Getenv("OAUTH_STATE_SECRET")
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(parts[2]), []byte(expected)) {
+		return "", "", errors.New("oauth state signature mismatch")
+	}
+	return parts[0], parts[1], nil
+}
+
+func SetOAuthStateCookie(w http.ResponseWriter, value string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   300,
+	})
+}
+
+func ReadOAuthStateCookie(r *http.Request) (string, error) {
+	c, err := r.Cookie(oauthStateCookieName)
+	if err != nil {
+		return "", fmt.Errorf("missing oauth state cookie: %w", err)
+	}
+	return c.Value, nil
+}
+
+func ClearOAuthStateCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+}
+```
 
 ## Provider-agnostic auth logic
 
@@ -192,11 +268,14 @@ Put this in `handlers/oauth.go`:
 package handlers
 
 import (
+	"encoding/json"
 	"database/sql"
+	"fmt"
+	"io"
 	"net/http"
 
 	auth "github.com/.../auth"
-	"github.com/markbates/goth/gothic"
+	"golang.org/x/oauth2"
 )
 
 var allowedOAuthProviders = map[string]struct{}{
@@ -209,38 +288,126 @@ func readProvider(r *http.Request) (string, bool) {
 	return provider, ok
 }
 
-func HandleOAuthStart() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		_, ok := readProvider(r)
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-
-		gothic.BeginAuthHandler(w, r)
-	}
-}
-
-func HandleOAuthCallback(db *sql.DB) http.HandlerFunc {
+func HandleOAuthStart(googleCfg *oauth2.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		provider, ok := readProvider(r)
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
+		if provider != "google" {
+			http.NotFound(w, r)
+			return
+		}
 
-		gothUser, err := gothic.CompleteUserAuth(w, r)
+		state, err := auth.NewRandomURLSafe(32)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		verifier, err := auth.NewRandomURLSafe(48)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		signedState, err := auth.SignOAuthState(state, verifier)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		auth.SetOAuthStateCookie(w, signedState)
+
+		challenge := auth.PKCEChallenge(verifier)
+		url := googleCfg.AuthCodeURL(
+			state,
+			oauth2.AccessTypeOffline,
+			oauth2.SetAuthURLParam("code_challenge", challenge),
+			oauth2.SetAuthURLParam("code_challenge_method", "S256"),
+		)
+		http.Redirect(w, r, url, http.StatusFound)
+	}
+}
+
+type googleUserInfo struct {
+	Sub   string `json:"sub"`
+	Email string `json:"email"`
+}
+
+func fetchGoogleUserInfo(client *http.Client) (*googleUserInfo, error) {
+	resp, err := client.Get("https://openidconnect.googleapis.com/v1/userinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("userinfo request failed: %s", string(body))
+	}
+	var user googleUserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func HandleOAuthCallback(db *sql.DB, googleCfg *oauth2.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		provider, ok := readProvider(r)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if provider != "google" {
+			http.NotFound(w, r)
+			return
+		}
+
+		rawCookie, err := auth.ReadOAuthStateCookie(r)
+		if err != nil {
+			http.Error(w, "OAuth state missing", http.StatusUnauthorized)
+			return
+		}
+		auth.ClearOAuthStateCookie(w)
+
+		expectedState, verifier, err := auth.VerifyOAuthStateCookie(rawCookie)
+		if err != nil {
+			http.Error(w, "OAuth state invalid", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Query().Get("state") != expectedState {
+			http.Error(w, "OAuth state mismatch", http.StatusUnauthorized)
+			return
+		}
+
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			http.Error(w, "OAuth code missing", http.StatusUnauthorized)
+			return
+		}
+
+		tok, err := googleCfg.Exchange(
+			r.Context(),
+			code,
+			oauth2.SetAuthURLParam("code_verifier", verifier),
+		)
 		if err != nil {
 			http.Error(w, "OAuth login failed", http.StatusUnauthorized)
 			return
 		}
 
-		if gothUser.UserID == "" {
+		googleHTTPClient := googleCfg.Client(r.Context(), tok)
+		profile, err := fetchGoogleUserInfo(googleHTTPClient)
+		if err != nil {
+			http.Error(w, "OAuth login failed", http.StatusUnauthorized)
+			return
+		}
+		if profile.Sub == "" {
 			http.Error(w, "OAuth account missing user id", http.StatusUnauthorized)
 			return
 		}
 
-		userID, err := auth.GetOrCreateUserFromOAuth(r.Context(), db, provider, gothUser.UserID, gothUser.Email)
+		userID, err := auth.GetOrCreateUserFromOAuth(r.Context(), db, provider, profile.Sub, profile.Email)
 		if err != nil {
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
@@ -285,14 +452,14 @@ Put this in `main.go`:
 
 ```go
 func main() {
-	configureOAuth()
+	googleCfg := googleOAuthConfig()
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /login", handlers.HandleLoginPage)
 
-	mux.HandleFunc("GET /oauth/{provider}", handlers.HandleOAuthStart())
-	mux.HandleFunc("GET /oauth/{provider}/callback", handlers.HandleOAuthCallback(db))
+	mux.HandleFunc("GET /oauth/{provider}", handlers.HandleOAuthStart(googleCfg))
+	mux.HandleFunc("GET /oauth/{provider}/callback", handlers.HandleOAuthCallback(db, googleCfg))
 
 	handler := auth.SessionMiddleware(db)(mux)
 	http.ListenAndServe(":8080", handler)
@@ -304,7 +471,7 @@ Do not apply same-origin checks to OAuth callback routes. The provider redirects
 ## Add more providers
 
 The structure stays the same for any provider:
-1. Add provider to `goth.UseProviders(...)` in `configureOAuth()`
+1. Add an `oauth2.Config` for the provider and wire it into start/callback handlers
 2. Add provider name to `allowedOAuthProviders`
 3. Add provider callback URL in that provider's console
 4. Add a login button/link (`/oauth/{provider}`)
