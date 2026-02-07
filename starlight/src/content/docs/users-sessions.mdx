@@ -4,39 +4,58 @@ description: Setting up the user table and implementing server-side sessions in 
 ---
 
 import LLMExport from '../../components/LLMExport.astro';
+import ExternalLink from '../../components/ExternalLink.astro';
 
 <LLMExport title="Users & Sessions" slug="users-sessions" />
 
-HTTP doesn't remember anything between requests. Your server can't tell if two requests came from the same person. Cookies exist, but anyone could edit a "user_id" cookie to pretend they're someone else.
+HTTP is stateless by design. Your server has no idea if two requests were made by the same person. Cookies help with identifying, but anyone could edit a "user_id" cookie to pretend they're someone else.
 
-Sessions fix this. When someone signs in, you create a session on the server and hand them an unguessable token. They send that token back with each request. If it matches, you know who they are.
+This is why sessions were created. When someone signs in, you create a session on the server and hand them an unguessable token. They send that token back with each request. If it matches, you know who they are.
 
-We use `TEXT` for IDs and recommend [nanoids](https://github.com/matoous/go-nanoid). They're shorter than UUIDs, URL-safe, and you can double-click to select them (UUIDs with hyphens break on word boundaries). Avoid auto-incrementing integers. They let attackers enumerate your users and reveal how many records you have.
+## Before you start
+
+- Go 1.22+
+- A database connection via `database/sql`
+- nanoid package: `github.com/matoous/go-nanoid/v2`
+- HTTPS for sending secure cookies (set secure to false for local dev)
+
+## File layout
+
+Use this structure for the snippets in this guide:
+
+```
+/auth
+  /sessions.go              // Session model + create/validate/delete
+  /cookies.go               // SetSessionCookie/ClearSessionCookie/GetSessionToken
+  /middleware.go            // SessionMiddleware/GetSession/RequireSession (+ optional CSRF helper)
+/main.go                    // Router + handlers
+```
 
 ## Session table
 
-Sessions have an ID, a hashed secret, and a user reference. The ID and secret are separate to prevent timing attacks during lookup and avoid hashing client input before knowing the session exists. The secret gets hashed before storage so a database leak won't compromise every session at once.
+Sessions are comprised of an ID, a hashed secret, and a user ID for the corresponding user.
+
+We split tokens into ID + secret so we can do a fast indexed lookup by ID, then verify proof-of-ownership by comparing the secret hash in constant time.
+
+The secret is hashed before storage so that a database leak won't immediately compromise all sessions.
 
 ```sql
-CREATE TABLE session (
+CREATE TABLE sessions (
     id TEXT NOT NULL PRIMARY KEY,
     secret_hash BLOB NOT NULL,
-    user_id TEXT NOT NULL REFERENCES user(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
     created_at INTEGER NOT NULL
 );
 
-CREATE INDEX session_user_id_idx ON session(user_id);
+CREATE INDEX sessions_user_id_idx ON sessions(user_id);
 ```
-
-The `secret_hash` stores as raw bytes. You could hex or base64 encode it if you prefer text, but binary takes less space.
-
 
 ## User table
 
-You define what goes in the user table. You need an ID at minimum. Add whatever else your app needs. Email, username, timestamps, etc.
+You define what data your users store. You need an ID at minimum but everything else is up to your app's needs.
 
 ```sql
-CREATE TABLE user (
+CREATE TABLE users (
     id TEXT NOT NULL PRIMARY KEY,
     created_at INTEGER NOT NULL
 );
@@ -54,7 +73,9 @@ Both parts are random strings with at least 120 bits of entropy. The ID finds th
 
 ## Generating IDs
 
-Use [go-nanoid](https://github.com/matoous/go-nanoid) to generate IDs:
+We use [go-nanoid](https://github.com/matoous/go-nanoid) to generate IDs:
+
+Use this in `auth/sessions.go` and anywhere else you create IDs (for example users).
 
 ```go
 import gonanoid "github.com/matoous/go-nanoid/v2"
@@ -66,11 +87,16 @@ userID, err := gonanoid.New(12)
 sessionID, err := gonanoid.New()
 ```
 
-Nanoid uses `crypto/rand` under the hood, so the IDs are cryptographically secure. A 21-character nanoid has about 126 bits of entropy. More than enough to prevent brute-force guessing.
+Nanoid uses `crypto/rand` under the hood, so the IDs are cryptographically secure. A 21-character nanoid has about 126 bits of entropy. This is enough to prevent brute-force guessing and allow us to generate 1,000,000 IDs/second without worrying about collisions.
+
+<ExternalLink href="https://alex7kom.github.io/nano-nanoid-cc/?alphabet=_-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz&size=21&speed=1000&speedUnit=second"
+>More info on this</ExternalLink>
 
 ## Creating a session
 
 When someone signs in, create a session and return the token:
+
+Put this in `auth/sessions.go`:
 
 ```go
 package auth
@@ -106,7 +132,7 @@ func CreateSession(ctx context.Context, db *sql.DB, userID string) (token string
 	now := time.Now().UTC()
 
 	_, err = db.ExecContext(ctx,
-		"INSERT INTO session (id, secret_hash, user_id, created_at) VALUES (?, ?, ?, ?)",
+		"INSERT INTO sessions (id, secret_hash, user_id, created_at) VALUES (?, ?, ?, ?)",
 		id, secretHash, userID, now.Unix(),
 	)
 	if err != nil {
@@ -129,6 +155,8 @@ SHA-256 works fine here. Unlike passwords, the secret already has 120 bits of en
 On each request, grab the token from the cookie, validate its format, look up the session, check expiration, and verify the secret.
 
 Validate the token format before doing anything else. Reject tokens that don't match the expected length. This prevents garbage input from hitting your database and keeps your logs clean.
+
+Put this in `auth/sessions.go`:
 
 ```go
 package auth
@@ -185,7 +213,7 @@ func ValidateSession(ctx context.Context, db *sql.DB, token string) (*Session, e
 
 func getSession(ctx context.Context, db *sql.DB, sessionID string) (*Session, error) {
 	row := db.QueryRowContext(ctx,
-		"SELECT id, secret_hash, user_id, created_at FROM session WHERE id = ?",
+		"SELECT id, secret_hash, user_id, created_at FROM sessions WHERE id = ?",
 		sessionID,
 	)
 
@@ -204,7 +232,7 @@ func getSession(ctx context.Context, db *sql.DB, sessionID string) (*Session, er
 }
 
 func DeleteSession(ctx context.Context, db *sql.DB, sessionID string) error {
-	_, err := db.ExecContext(ctx, "DELETE FROM session WHERE id = ?", sessionID)
+	_, err := db.ExecContext(ctx, "DELETE FROM sessions WHERE id = ?", sessionID)
 	return err
 }
 ```
@@ -215,9 +243,11 @@ func DeleteSession(ctx context.Context, db *sql.DB, sessionID string) error {
 
 When someone changes their password or you spot suspicious activity, kill all their sessions:
 
+Put this in `auth/sessions.go`:
+
 ```go
 func DeleteUserSessions(ctx context.Context, db *sql.DB, userID string) error {
-	_, err := db.ExecContext(ctx, "DELETE FROM session WHERE user_id = ?", userID)
+	_, err := db.ExecContext(ctx, "DELETE FROM sessions WHERE user_id = ?", userID)
 	return err
 }
 ```
@@ -225,6 +255,8 @@ func DeleteUserSessions(ctx context.Context, db *sql.DB, userID string) error {
 ## Storing the token in a cookie
 
 Send the token in an HttpOnly cookie. JavaScript can't read HttpOnly cookies, which protects against XSS.
+
+Put this in `auth/cookies.go`:
 
 ```go
 package auth
@@ -242,7 +274,7 @@ func SetSessionCookie(w http.ResponseWriter, token string) {
 		Path:     "/",
 		MaxAge:   int(SessionExpiresIn.Seconds()),
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   true, // set to false for local testing
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -270,8 +302,8 @@ func GetSessionToken(r *http.Request) string {
 
 What each attribute does:
 - **HttpOnly**: JavaScript can't touch it
-- **Secure**: Only sent over HTTPS
-- **SameSite=Lax**: Sent on normal navigation, blocked on cross-site requests
+- **Secure**: Only sent over HTTPS. Set this to false if you're testing locally.
+- **SameSite=Lax**: Helps against CSRF while still allowing most top-level link navigations
 - **Path=/**: Works on all routes
 - **MaxAge**: Matches your session expiration
 
@@ -279,7 +311,16 @@ What each attribute does:
 
 `SameSite=Lax` helps, but you should still check the Origin header on requests that change data:
 
+Put this helper in `auth/middleware.go` (or split it into `auth/csrf.go` if you prefer).
+
 ```go
+package auth
+
+import (
+	"net/http"
+	"net/url"
+)
+
 func VerifyRequestOrigin(r *http.Request, allowedOrigin string) bool {
 	if r.Method == "GET" || r.Method == "HEAD" || r.Method == "OPTIONS" {
 		return true
@@ -287,12 +328,24 @@ func VerifyRequestOrigin(r *http.Request, allowedOrigin string) bool {
 
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		origin = r.Header.Get("Referer")
+		referer := r.Header.Get("Referer")
+		if referer == "" {
+			return false
+		}
+
+		u, err := url.Parse(referer)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return false
+		}
+
+		origin = u.Scheme + "://" + u.Host
 	}
 
 	return origin == allowedOrigin
 }
 ```
+
+`allowedOrigin` should be the full origin (`scheme://host[:port]`), for example `https://app.example.com`.
 
 Use this in middleware for any endpoint that modifies state.
 
@@ -301,6 +354,8 @@ Origin checking is a lightweight option when combined with SameSite cookies and 
 ## Middleware
 
 Here's middleware that validates sessions and attaches them to the request context:
+
+Put this in `auth/middleware.go`:
 
 ```go
 package auth
@@ -355,7 +410,11 @@ func RequireSession(next http.Handler) http.Handler {
 
 ## Putting it together
 
+Put this in `main.go`:
+
 ```go
+import auth "github.com/.../auth"
+
 func main() {
 	db, _ := sql.Open("sqlite3", "app.db")
 
@@ -400,6 +459,17 @@ func handleLogout(db *sql.DB) http.HandlerFunc {
 }
 ```
 
+Request flow:
+1. `POST /login` creates a session and sets the cookie
+2. Browser sends cookie on later requests
+3. `SessionMiddleware` validates token and loads session
+4. Protected handlers use `RequireSession` and read session from context
+
+Common gotchas:
+- `Secure: true` cookies are not sent over plain HTTP. If you need to test with HTTP then set secure to false.
+- If your app serves multiple subdomains, review cookie `Domain` and `SameSite` settings
+- Keep `SessionExpiresIn` and cookie `MaxAge` aligned (as shown here)
+
 ## Next up
 
-You've got the foundation now. Head to [Email & Password](/email-password) to add account creation and login.
+You've got the foundation now. Head to [Email & Password](/email-password) to learn about storing emails and passwords.
