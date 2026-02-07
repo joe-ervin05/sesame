@@ -7,4 +7,308 @@ import LLMExport from '../../components/LLMExport.astro';
 
 <LLMExport title="OAuth" slug="oauth" />
 
-Coming soon...
+This builds on [Users & Sessions](/users-sessions). You'll add OAuth login with [Goth](https://github.com/markbates/goth) using a provider-agnostic structure, then configure Google first.
+
+## Before you start
+
+- Go 1.22+
+- Existing sessions and cookies from [Users & Sessions](/users-sessions)
+- A Google OAuth app with client ID/secret
+- Callback URL configured in Google console (for local dev: `http://localhost:8080/oauth/google/callback`)
+
+## File layout
+
+```diff
+ /auth
+   /sessions.go
+   /cookies.go
+   /middleware.go
++  /oauth.go          // provider account linking + user creation
+ /handlers
++  /oauth.go          // oauth start + callback handlers
++  /pages.go          // login page with oauth button
+ /main.go
+```
+
+## OAuth accounts table
+
+Store provider identities separately from users so one user can link multiple providers.
+
+```sql
+CREATE TABLE oauth_accounts (
+    id TEXT NOT NULL PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    email TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(provider, provider_user_id)
+);
+
+CREATE INDEX oauth_accounts_user_id_idx ON oauth_accounts(user_id);
+```
+
+## Configure Goth and Google
+
+Put this in `main.go` startup:
+
+```go
+import (
+	"errors"
+	"net/http"
+	"os"
+
+	"github.com/gorilla/sessions"
+	"github.com/markbates/goth"
+	"github.com/markbates/goth/gothic"
+	"github.com/markbates/goth/providers/google"
+)
+
+func configureOAuth() {
+	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
+	googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	googleCallbackURL := os.Getenv("GOOGLE_CALLBACK_URL")
+
+	goth.UseProviders(
+		google.New(googleClientID, googleClientSecret, googleCallbackURL, "email", "profile"),
+	)
+
+	store := sessions.NewCookieStore([]byte(os.Getenv("GOTH_SESSION_SECRET")))
+	store.Options.Path = "/"
+	store.Options.HttpOnly = true
+	store.Options.Secure = true // set to false for local testing over plain HTTP
+	store.Options.MaxAge = 300  // short-lived oauth session
+	gothic.Store = store
+
+	defaultGetProviderName := gothic.GetProviderName
+	gothic.GetProviderName = func(r *http.Request) (string, error) {
+		if provider := r.PathValue("provider"); provider != "" {
+			return provider, nil
+		}
+		if defaultGetProviderName != nil {
+			return defaultGetProviderName(r)
+		}
+		return "", errors.New("provider not found")
+	}
+}
+```
+
+Environment variables:
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_CALLBACK_URL`
+- `GOTH_SESSION_SECRET`
+
+## Provider-agnostic auth logic
+
+Put this in `auth/oauth.go`:
+
+```go
+package auth
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"time"
+
+	gonanoid "github.com/matoous/go-nanoid/v2"
+)
+
+func GetOrCreateUserFromOAuth(ctx context.Context, db *sql.DB, provider, providerUserID, email string) (string, error) {
+	userID, err := getUserIDByOAuthAccount(ctx, db, provider, providerUserID)
+	if err != nil {
+		return "", err
+	}
+	if userID != "" {
+		return userID, nil
+	}
+
+	newUserID, err := gonanoid.New(12)
+	if err != nil {
+		return "", err
+	}
+
+	oauthAccountID, err := gonanoid.New()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC().Unix()
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO users (id, created_at) VALUES (?, ?)",
+		newUserID, now,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO oauth_accounts (id, user_id, provider, provider_user_id, email, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		oauthAccountID, newUserID, provider, providerUserID, email, now,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+
+	return newUserID, nil
+}
+
+func getUserIDByOAuthAccount(ctx context.Context, db *sql.DB, provider, providerUserID string) (string, error) {
+	row := db.QueryRowContext(ctx,
+		"SELECT user_id FROM oauth_accounts WHERE provider = ? AND provider_user_id = ?",
+		provider, providerUserID,
+	)
+
+	var userID string
+	err := row.Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	return userID, nil
+}
+```
+
+## OAuth handlers
+
+Put this in `handlers/oauth.go`:
+
+```go
+package handlers
+
+import (
+	"database/sql"
+	"net/http"
+
+	auth "github.com/.../auth"
+	"github.com/markbates/goth/gothic"
+)
+
+var allowedOAuthProviders = map[string]struct{}{
+	"google": {},
+}
+
+func readProvider(r *http.Request) (string, bool) {
+	provider := r.PathValue("provider")
+	_, ok := allowedOAuthProviders[provider]
+	return provider, ok
+}
+
+func HandleOAuthStart() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, ok := readProvider(r)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		gothic.BeginAuthHandler(w, r)
+	}
+}
+
+func HandleOAuthCallback(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		provider, ok := readProvider(r)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		gothUser, err := gothic.CompleteUserAuth(w, r)
+		if err != nil {
+			http.Error(w, "OAuth login failed", http.StatusUnauthorized)
+			return
+		}
+
+		if gothUser.UserID == "" {
+			http.Error(w, "OAuth account missing user id", http.StatusUnauthorized)
+			return
+		}
+
+		userID, err := auth.GetOrCreateUserFromOAuth(r.Context(), db, provider, gothUser.UserID, gothUser.Email)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		token, err := auth.CreateSession(r.Context(), db, userID)
+		if err != nil {
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+
+		auth.SetSessionCookie(w, token)
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+	}
+}
+```
+
+## Login page
+
+Put this in `handlers/pages.go`:
+
+```go
+func HandleLoginPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!doctype html>
+<html>
+  <body>
+    <h1>Log in</h1>
+    <p><a href="/oauth/google">Continue with Google</a></p>
+    <p><a href="/signup">Use email and password instead</a></p>
+  </body>
+</html>`))
+}
+```
+
+If your app is OAuth-only, remove the email/password link.
+
+## Route wiring
+
+Put this in `main.go`:
+
+```go
+func main() {
+	configureOAuth()
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /login", handlers.HandleLoginPage)
+
+	mux.HandleFunc("GET /oauth/{provider}", handlers.HandleOAuthStart())
+	mux.HandleFunc("GET /oauth/{provider}/callback", handlers.HandleOAuthCallback(db))
+
+	handler := auth.SessionMiddleware(db)(mux)
+	http.ListenAndServe(":8080", handler)
+}
+```
+
+Do not apply same-origin checks to OAuth callback routes. The provider redirects from a different origin by design.
+
+## Add more providers
+
+The structure stays the same for any provider:
+1. Add provider to `goth.UseProviders(...)` in `configureOAuth()`
+2. Add provider name to `allowedOAuthProviders`
+3. Add provider callback URL in that provider's console
+4. Add a login button/link (`/oauth/{provider}`)
+
+## Next up
+
+Head to [Rate Limiting](/rate-limiting) to add a second factor for higher-risk accounts.
