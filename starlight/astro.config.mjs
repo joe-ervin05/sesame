@@ -14,7 +14,7 @@ export default defineConfig({
 				{ label: "Overview", slug: "index" },
 				{ label: "1. Users & Sessions", slug: "users-sessions" },
 				{ label: "2. Email & Password Setup", slug: "email-password" },
-				{ label: "3. Signup & Login", slug: "signup-login" },
+				{ label: "3. Password Signup & Login", slug: "password-signup-login" },
 				{ label: "4. Verification & Recovery", slug: "verification-recovery" },
 				{ label: "5. Rate Limiting", slug: "rate-limiting" },
 				{ label: "6. Inactivity Timeouts", slug: "inactivity-timeouts" },
